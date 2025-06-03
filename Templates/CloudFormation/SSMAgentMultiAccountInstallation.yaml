@@ -1,0 +1,2163 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS CloudFormation template to deploy resources for SSM Agent install automation in multi account setup. This is part of the cloud operations blog.
+Parameters:
+  DeploymentTargetsOUs:
+    Description: Specify the one or more Organizational Unit IDs (OU IDs)where target instances are located. (e.g. ou-srdk-01234567,ou-srdk-98765432)
+    Type: CommaDelimitedList
+  OrganizationId:
+    Description: (Optional) For Organizational ID. (e.g., o-kiw5ig7em1)
+    Type: String
+    AllowedPattern: '^o-[a-z0-9]{10,32}$'
+  TargetRegions:
+    Type: CommaDelimitedList
+    Description: "One or more regions to deploy the required resources. Input the regions as List where instances are running. (e.g. us-east-1, us-east-2)"
+Resources:
+  #-------------------------------------------------
+  # Main Automation Orchestrator runbook
+  #-------------------------------------------------
+  SSMAutomationRunbookOrchestrator:
+    Type: AWS::SSM::Document
+    DependsOn: S3LogsBucket
+    Properties:
+      DocumentFormat: YAML
+      DocumentType: Automation
+      Name: SSMAgentInstall-Orchestrator
+      Content:
+        schemaVersion: '0.3'
+        description: |
+          This automation runbook serves as the primary orchestrator for deploying SSM Agent across multiple AWS accounts. It initiates the deployment process by executing the SSMAgentInstall-Primary runbook in a multi-account automation mode, coordinating the installation workflow across all specified target accounts.
+
+          There are two ways to provide the targets for the automation -
+            - Target the Instances using Tags. For this option, provide values for these input parameters - TargetTagKey,TargetTagValue,TargetAccounts,TargetRegions
+            - Target the unmanaged Instances from the diagnose and remediate results. For this option, provide the value for the input parameter - DiagnoseAndRemediateS3Results
+        assumeRole: '{{ AutomationAssumeRole }}'
+        parameters:
+          AutomationAssumeRole:
+            default: !GetAtt AutomationAdministrationServiceRole.Arn
+            description: (Required) The Amazon Resource Name (ARN) of the IAM role that allows Automation to perform the actions on your behalf.
+            type: AWS::IAM::Role::Arn
+          UploadLogsToS3Bucket:
+            default: !Ref S3LogsBucket
+            description: (Required)S3 Bucket to upload the logs. A default s3 bucket with prefix ssm-agent-install is created by cloudformation stack.
+            type: AWS::S3::Bucket::Name
+          TargetTagKey:
+            default: ''
+            description: (Optional) Provide the Target's key to target the automation in the format as tag:<tagname>. To target all unmanaged instances use InstanceIds as an input.
+            type: String
+            allowedPattern: "^$|^InstanceIds$|^tag:.+$"
+          TargetTagValue:
+            default: ''
+            description: (Optional) Provide the Target's tag value to target the automation. to target all unmanaged instances use *
+            type: String
+            maxChars: 50
+          TargetAccounts:
+            maxItems: 20
+            description: (Optional) Enter the Account IDs or OUs to target this automation. Be sure that the target OU contains the desired accounts. (e.g. ou-srdk-01234567,012345678901,ou-srdk-98765432)
+            type: StringList
+            default: ['']
+          TargetRegions:
+            description: (Optional) Regions to target. Input the regions as List where instances are running. (e.g. us-east-1, us-east-2)
+            type: StringList
+            maxItems: 50
+            default: ['']
+          DiagnoseAndRemediateS3Results:
+            default: ''
+            description: (Optional) Complete S3 Path to the unmanaged-ec2-diagnosis.csv file to access diagnose and remediate results.
+            type: String
+            allowedPattern: "^$|^s3://[a-z0-9][a-z0-9.-]*[a-z0-9]/.*csv$"
+        mainSteps:
+          - name: BranchIfS3Path
+            action: aws:branch
+            inputs:
+              Choices:
+                - NextStep: GetAccountsIDFromS3Path
+                  Not:
+                    Variable: '{{ DiagnoseAndRemediateS3Results }}'
+                    StringEquals: ''
+                - NextStep: executeAutomationOnTargets
+                  Not:
+                    Variable: '{{ TargetTagKey }}'
+                    StringEquals: ''
+              Default: TargetsNotProvided
+          - name: TargetsNotProvided
+            action: aws:executeScript
+            isEnd: true
+            inputs:
+              Script: |-
+                def script_handler(events, context):
+                  return {'message': 'No Target Key/value or Path to s3 diagnosis and Results is provided. Either of the two must be provided.'}
+              Runtime: python3.11
+              Handler: script_handler
+            outputs:
+              - Type: String
+                Name: message
+                Selector: $.Payload.message
+          - name: executeAutomationOnTargets
+            action: aws:executeAutomation
+            nextStep: GenerateReportS3
+            isEnd: false
+            onFailure: Continue
+            inputs:
+              RuntimeParameters:
+                UploadLogsToS3Bucket: '{{ UploadLogsToS3Bucket }}'
+                AutomationAssumeRole: '{{ AutomationAssumeRole }}'
+                TargetTagKey: '{{ TargetTagKey }}'
+                TargetRegions: '{{ TargetRegions }}'
+                TargetTagValue: '{{ TargetTagValue }}'
+                OrchestratorAutomationID: '{{ automation:EXECUTION_ID }}'
+              DocumentName: SSMAgentInstall-Primary
+              TargetLocations:
+                - ExecutionRoleName: SSMAgentInstall-MAMR-AutomationExecutionRole
+                  Regions:
+                    - '{{ global:REGION }}'
+                  TargetLocationMaxConcurrency: '5'
+                  Accounts:
+                    - '{{ TargetAccounts }}'
+          - name: GenerateReportS3
+            description: Generate output report csv file.
+            action: aws:executeScript
+            isEnd: true
+            inputs:
+              Script: |-
+                import boto3
+                import io
+                import sys
+                import subprocess
+                from datetime import datetime
+                from typing import List, Optional
+
+                try:
+                    boto_modules = [m for m in sys.modules.keys() if m.startswith('boto')]
+                    for m in boto_modules:
+                        del(sys.modules[m])
+
+                    packages = ['boto3', 'pandas']
+                    for package in packages:
+                        subprocess.check_call([sys.executable, "-m", "pip", "install", package, "-t", "/tmp/"])
+
+                    sys.path.insert(0, '/tmp/')
+                    import pandas as pd
+
+                except Exception as e:
+                    print(f"Failed to install dependencies: {str(e)}")
+                    raise
+
+                class CSVCombiner:
+                    def __init__(self, bucket_name: str, parent_execution_id: str):
+                        self.bucket_name = bucket_name
+                        self.parent_execution_id = parent_execution_id
+                        self.s3_client = boto3.client('s3')
+
+                    def _get_csv_files(self) -> List[dict]:
+                        """Retrieve all CSV files from S3 with the specified prefix."""
+                        csv_files = []
+                        try:
+                            paginator = self.s3_client.get_paginator('list_objects_v2')
+                            pages = paginator.paginate(
+                                Bucket=self.bucket_name,
+                                Prefix=f"{self.parent_execution_id}/"
+                            )
+                            for page in pages:
+                                if 'Contents' in page:
+                                    csv_files.extend([
+                                        obj for obj in page['Contents']
+                                        if 'automation_results' in obj['Key'] and obj['Key'].endswith('.csv')
+                                    ])
+
+                            return csv_files
+                        except Exception as e:
+                            print(f"Error listing S3 objects: {str(e)}")
+                            raise
+
+                    def _process_csv_file(self, obj: dict) -> Optional[pd.DataFrame]:
+                        """Process individual CSV file and return DataFrame."""
+                        try:
+                            response = self.s3_client.get_object(
+                                Bucket=self.bucket_name,
+                                Key=obj['Key']
+                            )
+
+                            path_parts = obj['Key'].split('/')
+                            account_id = path_parts[1] if len(path_parts) > 1 else 'unknown'
+
+                            df = pd.read_csv(io.BytesIO(response['Body'].read()))
+                            df['AccountId'] = account_id
+                            df['SourceFile'] = obj['Key']
+
+                            return df
+                        except Exception as e:
+                            print(f"Error processing file {obj['Key']}: {str(e)}")
+                            return None
+
+                    def _generate_status_report(self, df: pd.DataFrame) -> None:
+                        """Generate and print status report from combined DataFrame."""
+                        try:
+                            total_instances = len(df)
+                            failed_instances = len(df[df['Status'] == 'Failed'])
+                            success_instances = len(df[df['Status'] == 'Success'])
+
+                            print(f"\nStatus Report:")
+                            print(f"Total Instances Targeted: {total_instances}")
+                            print(f"Failed Instances: {failed_instances}")
+                            print(f"Success Instances: {success_instances}")
+                        except Exception as e:
+                            print(f"Error generating status report: {str(e)}")
+
+                    def combine_csv_files(self) -> None:
+                        """Main method to combine CSV files and generate report."""
+                        try:
+                            csv_files = self._get_csv_files()
+
+                            if not csv_files:
+                                print("No CSV files found to combine")
+                                return
+
+                            # Process all CSV files
+                            all_dfs = []
+                            for obj in csv_files:
+                                df = self._process_csv_file(obj)
+                                if df is not None:
+                                    all_dfs.append(df)
+
+                            if not all_dfs:
+                                print("No valid CSV data to combine")
+                                return
+
+                            # Combine DataFrames
+                            combined_df = pd.concat(all_dfs, ignore_index=True)
+
+                            # Generate output file
+                            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                            output_key = f"{self.parent_execution_id}/combined_results_{timestamp}.csv"
+
+                            # Save to S3
+                            csv_buffer = io.StringIO()
+                            combined_df.to_csv(csv_buffer, index=False)
+                            self.s3_client.put_object(
+                                Bucket=self.bucket_name,
+                                Key=output_key,
+                                Body=csv_buffer.getvalue()
+                            )
+                            print(f"Successfully created final reporting CSV file: s3://{self.bucket_name}/{output_key}")
+
+                            self._generate_status_report(combined_df)
+
+                        except Exception as e:
+                            print(f"Error in combine_csv_files: {str(e)}")
+                            raise
+
+                def lambda_handler(event, context):
+                    try:
+                        # Extract configuration
+                        bucket_name = event['s3logs']
+                        parent_execution_id = context['automation:EXECUTION_ID']
+
+                        combiner = CSVCombiner(bucket_name, parent_execution_id)
+                        combiner.combine_csv_files()
+
+                    except Exception as e:
+                        print(f"Lambda execution failed: {str(e)}")
+                        raise
+              Runtime: python3.11
+              InputPayload:
+                s3logs: '{{ UploadLogsToS3Bucket }}'
+              Handler: lambda_handler
+          - name: GetAccountsIDFromS3Path
+            action: aws:executeScript
+            nextStep: BranchIfUnmanagedInstancesFromS3
+            isEnd: false
+            onFailure: Abort
+            inputs:
+              Script: |-
+                import csv
+                import boto3
+                from botocore.exceptions import ClientError
+                from collections import defaultdict
+                from io import StringIO
+                import itertools
+
+                def process_csv_in_chunks(csv_file, chunk_size=500):
+                    """Process CSV file in chunks to handle large files efficiently"""
+                    accounts = set()
+                    while True:
+                        chunk = list(itertools.islice(csv_file, chunk_size))
+                        if not chunk:
+                            break
+                        for row in chunk:
+                            if row.get('ResourceType', '').lower() == 'instance' and row.get('Issue', '') == 'Unidentified issues':
+                                accounts.add(row.get('Account'))
+                    return list(accounts)
+
+                def copy_s3_object(s3_client, source_bucket, source_key, dest_bucket, dest_key):
+                    """Copy object from source to destination S3 location"""
+                    try:
+                        copy_source = {
+                            'Bucket': source_bucket,
+                            'Key': source_key
+                        }
+
+                        s3_client.copy_object(
+                            CopySource=copy_source,
+                            Bucket=dest_bucket,
+                            Key=dest_key
+                        )
+
+                        waiter = s3_client.get_waiter('object_exists')
+                        waiter.wait(
+                            Bucket=dest_bucket,
+                            Key=dest_key
+                        )
+                        return True
+                    except ClientError as e:
+                        print(f"Error copying S3 object: {str(e)}")
+                        raise
+
+                def script_handler(events, context):
+                    """Main handler function for processing unmanaged EC2 instances"""
+                    s3_path = events['DiagnoseS3Path']
+                    diagnose_log_bucket = events['UploadLogsToS3Bucket']
+                    orchestrator_id = context['automation:EXECUTION_ID']
+                    # Initialize S3 client
+                    s3_client = boto3.client('s3')
+
+                    try:
+                        bucket_name = s3_path.split('/')[2]
+                        key = '/'.join(s3_path.split('/')[3:])
+
+                        # Get the original filename (unmanaged-ec2-diagnosis.csv)
+                        original_filename = key.split('/')[-1]
+
+                        destination_key = f"{orchestrator_id}/DiagnoseRemediateResults/{original_filename}"
+                        new_s3_path=f"s3://{diagnose_log_bucket}/{destination_key}"
+
+                        # Copy the object to the new bucket
+                        copy_s3_object(s3_client, bucket_name, key, diagnose_log_bucket, destination_key)
+
+                        try:
+                            response = s3_client.get_object(Bucket=diagnose_log_bucket, Key=destination_key)
+                        except ClientError as e:
+                            if e.response['Error']['Code'] == 'NoSuchKey':
+                                return {"status": "error", "message": "(unmanaged-ec2-diagnosis.csv file not found in bucket"}
+                            elif e.response['Error']['Code'] == 'NoSuchBucket':
+                                return {"status": "error", "message": "Bucket not found"}
+                            raise
+
+                        csv_content = response['Body'].read().decode('utf-8')
+                        csv_file = StringIO(csv_content)
+
+                        # Count lines to check if file is empty
+                        lines = csv_content.split('\n')
+                        if len(lines) <= 1:
+                            return {
+                                    'accountIDs': [],
+                                    'message': 'No unmanaged instances found.',
+                                    'result_s3_path': new_s3_path
+                                }
+
+                        # Process CSV in chunks. First reset the pointer.
+                        csv_file.seek(0)
+                        reader = csv.DictReader(csv_file)
+                        unmanaged_account_list = process_csv_in_chunks(reader)
+
+                        if not unmanaged_account_list:
+                            return {
+                                    'accountIDs': [],
+                                    'message': 'No unmanaged instances found.',
+                                    'result_s3_path': new_s3_path
+                                }
+                        print(f"Found {len(unmanaged_account_list)} accounts with unmanaged instances.")
+                        return {
+                            'accountIDs': unmanaged_account_list,
+                            'message': 'Unmanaged Instances found.',
+                            'result_s3_path': new_s3_path
+                        }
+                    except ValueError as e:
+                        return {"status": "error", "message": f"Validation error: {str(e)}"}
+                    except ClientError as e:
+                        return {"status": "error", "message": f"S3 error: {str(e)}"}
+                    except Exception as e:
+                        return {"status": "error", "message": f"Error processing file: {str(e)}"}
+              Runtime: python3.11
+              InputPayload:
+                DiagnoseS3Path: '{{ DiagnoseAndRemediateS3Results }}'
+                UploadLogsToS3Bucket: '{{ UploadLogsToS3Bucket }}'
+              Handler: script_handler
+            outputs:
+              - Type: String
+                Name: message
+                Selector: $.Payload.message
+              - Type: StringList
+                Name: UnmanagedAccountIDs
+                Selector: $.Payload.accountIDs
+              - Type: String
+                Name: diagnose_s3_path
+                Selector: $.Payload.result_s3_path
+          - name: BranchIfUnmanagedInstancesFromS3
+            action: aws:branch
+            inputs:
+              Choices:
+                - NextStep: executeAutomationOnTargetsS3
+                  Variable: '{{ GetAccountsIDFromS3Path.message }}'
+                  StringEquals: Unmanaged Instances found.
+              Default: NoUnmanagedInstances
+          - name: NoUnmanagedInstances
+            action: aws:executeScript
+            isEnd: true
+            inputs:
+              Script: |-
+                def script_handler(events, context):
+                  return {'message': 'No Unmanaged Instances found in the Diagnosis and Remediate Results.'}
+              Runtime: python3.11
+              Handler: script_handler
+            outputs:
+              - Type: String
+                Name: message
+                Selector: $.Payload.message
+          - name: executeAutomationOnTargetsS3
+            action: aws:executeAutomation
+            nextStep: GenerateReportS3
+            isEnd: false
+            onFailure: Continue
+            inputs:
+              RuntimeParameters:
+                UploadLogsToS3Bucket: '{{ UploadLogsToS3Bucket }}'
+                AutomationAssumeRole: '{{ AutomationAssumeRole }}'
+                DiagnoseAndRemediateS3Results: '{{ GetAccountsIDFromS3Path.diagnose_s3_path }}'
+                OrchestratorAutomationID: '{{ automation:EXECUTION_ID }}'
+              DocumentName: SSMAgentInstall-Primary
+              TargetLocations:
+                - ExecutionRoleName: SSMAgentInstall-MAMR-AutomationExecutionRole
+                  Regions:
+                    - '{{ global:REGION }}'
+                  TargetLocationMaxConcurrency: '5'
+                  Accounts:
+                    - '{{ GetAccountsIDFromS3Path.UnmanagedAccountIDs }}'
+        outputs:
+          - GenerateReportS3.OutputPayload
+  #------------------------------
+  # Automation Primary runbook
+  #------------------------------
+  SSMAutomationRunbookPrimary:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentFormat: YAML
+      DocumentType: Automation
+      Name: SSMAgentInstall-Primary
+      Content:
+        schemaVersion: '0.3'
+        description: |
+          This automation runbook is invoked by the SSMAgentInstall-Orchestrator runbook, managing the deployment of SSM Agent across target accounts. It executes the SSMAgentInstall-Secondary runbook in multi-account and multi-region mode, across all specified AWS regions.
+        assumeRole: '{{ AutomationAssumeRole }}'
+        parameters:
+          AutomationAssumeRole:
+            description: (Required) The Amazon Resource Name (ARN) of the IAM role that allows Automation to perform the actions on your behalf.
+            type: AWS::IAM::Role::Arn
+          UploadLogsToS3Bucket:
+            description: (Recommended)S3 Bucket to upload the logs.
+            type: AWS::S3::Bucket::Name
+          TargetTagKey:
+            default: ''
+            description: (Optional)Provide the Target's key to target the automation in the format as tag:<tagname>
+            type: String
+            allowedPattern: "^$|^InstanceIds$|^tag:.+$"
+          TargetTagValue:
+            default: ''
+            description: (Optional) Provide the Target's Value to target the automation.
+            type: String
+            maxChars: 50
+          TargetRegions:
+            description: (Optional) Regions to target.
+            type: StringList
+            maxItems: 50
+            default: ['']
+          DiagnoseAndRemediateS3Results:
+            default: ''
+            description: (Optional) Complete S3 Path to the unmanaged-ec2-diagnosis.csv file to access diagnose and remediate results.
+            type: String
+            allowedPattern: "^$|^s3://[a-z0-9][a-z0-9.-]*[a-z0-9]/.*csv$"
+          TemporaryInstanceProfileToUse:
+            default: SSMAgentInstall-TemporaryInstanceProfile
+            description: (Optional) Name of the Temporary profile to attach during execution. A default instance profile is created by cloudformation stack.
+            type: String
+          OrchestratorAutomationID:
+            description: Automation Execution ID for the central account.
+            type: String
+        mainSteps:
+          - name: BranchIfS3Path
+            action: aws:branch
+            isEnd: true
+            inputs:
+              Choices:
+                - NextStep: GetInstancesFromS3
+                  Not:
+                    Variable: '{{ DiagnoseAndRemediateS3Results }}'
+                    StringEquals: ''
+                - NextStep: executeAutomationOnProvidedTags
+                  Not:
+                    Variable: '{{ TargetTagKey }}'
+                    StringEquals: ''
+          - name: GetInstancesFromS3
+            action: aws:executeScript
+            nextStep: BranchIfUnmanagedInstancesFromS3
+            isEnd: false
+            onFailure: Abort
+            inputs:
+              Script: |
+                import csv
+                import boto3
+                from botocore.exceptions import ClientError
+                from collections import defaultdict
+                from io import StringIO
+
+                def script_handler(event, context):
+                    """Main Lambda handler function."""
+                    s3_path = event['DiagnoseS3Path']
+                    account = context['global:ACCOUNT_ID']
+                    # Initialize S3 client
+                    s3_client = boto3.client('s3')
+
+                    try:
+                        # Parse S3 path to get bucket and key
+                        bucket_name = s3_path.split('/')[2]
+                        key = '/'.join(s3_path.split('/')[3:])
+
+                        # Get object from S3
+                        response = s3_client.get_object(Bucket=bucket_name, Key=key)
+
+                        # Read CSV content
+                        csv_content = response['Body'].read().decode('utf-8')
+                        csv_file = StringIO(csv_content)
+
+                        # Initialize region_instances dictionary
+                        region_instances = defaultdict(list)
+                        regions_with_unmanaged = []
+
+                        # Count lines to check if file is empty
+                        lines = csv_content.split('\n')
+                        if len(lines) <= 1:
+                            return {
+                                    'message': 'No unmanaged instances found.',
+                                    'regions_with_unmanaged' : [],
+                                    'instances' : {}
+                                }
+
+                        # Reset file pointer
+                        csv_file.seek(0)
+                        reader = csv.DictReader(csv_file)
+
+                        # Process each row
+                        for row in reader:
+                            if row['ResourceType'].lower() == 'instance' and row['Account'] == account and row['Issue'] == 'Unidentified issues':
+                                region = row['Region']
+                                resource_id = row['ResourceId']
+                                region_instances[region].append(resource_id)
+                                regions_with_unmanaged.append(region)
+
+                        # Convert defaultdict to regular dict
+                        result = dict(region_instances)
+                        regions_with_unmanaged_result = list(set(regions_with_unmanaged))
+
+                        if not result:
+                            return {
+                                    'message': 'No unmanaged instances found.',
+                                    'regions_with_unmanaged' : [],
+                                    'instances' : {}
+                                }
+                        return {
+                            'message': 'Unmanaged Instances found.',
+                            'regions_with_unmanaged' : regions_with_unmanaged_result,
+                            'instances': result
+                        }
+
+                    except ClientError as e:
+                        return {"status": "error", "message": f"S3 error: {str(e)}"}
+                    except Exception as e:
+                        return {"status": "error", "message": f"Error processing file: {str(e)}"}
+              Runtime: python3.11
+              InputPayload:
+                DiagnoseS3Path: '{{ DiagnoseAndRemediateS3Results }}'
+              Handler: script_handler
+            outputs:
+              - Type: String
+                Name: message
+                Selector: $.Payload.message
+              - Type: StringMap
+                Name: UnmanagedInstances
+                Selector: $.Payload.instances
+              - Type: StringList
+                Name: UnmanagedRegions
+                Selector: $.Payload.regions_with_unmanaged
+          - name: BranchIfUnmanagedInstancesFromS3
+            action: aws:branch
+            inputs:
+              Choices:
+                - NextStep: AddTagsS3Instances
+                  Variable: '{{ GetInstancesFromS3.message }}'
+                  StringEquals: Unmanaged Instances found.
+              Default: NoUnmanagedInstances
+          - name: AddTagsS3Instances
+            action: aws:executeScript
+            nextStep: BranchIfTagsAdded
+            isEnd: false
+            inputs:
+              Script: |-
+
+                import boto3
+                from botocore.exceptions import ClientError
+
+                def chunk_list(lst, chunk_size=999):
+                    """Split list into chunks of specified size"""
+                    return [lst[i:i + chunk_size] for i in range(0, len(lst), chunk_size)]
+
+                def add_tags(instances_by_region, updatetags):
+                    successful_instances = {}
+                    failed_instances = {}
+
+                    for region, instances in instances_by_region.items():
+                        ec2 = boto3.client('ec2', region_name=region)
+                        successful_instances[region] = []
+                        failed_instances[region] = []
+
+                        try:
+                            for batch in chunk_list(instances, 999):
+                                try:
+                                    ec2.create_tags(
+                                        Resources=batch,
+                                        Tags=updatetags
+                                    )
+                                    successful_instances[region].extend(batch)
+                                except Exception as e:
+                                    failed_instances[region].extend(batch)
+                                    print(f"Failed to add tags to batch in region {region}: {str(e)}")
+                        except Exception as e:
+                            print(f"Error processing region {region}: {str(e)}")
+
+                    return successful_instances, failed_instances
+
+                def delete_tags(instances_by_region, updatetags):
+                    successful_deletes = {}
+                    failed_deletes = {}
+
+                    for region, instances in instances_by_region.items():
+                        ec2 = boto3.client('ec2', region_name=region)
+                        successful_deletes[region] = []
+                        failed_deletes[region] = []
+
+                        for batch in chunk_list(instances, 1000):
+                            try:
+                                ec2.delete_tags(
+                                    Resources=batch,
+                                    Tags=updatetags
+                                )
+                                successful_deletes[region].extend(batch)
+                            except Exception as e:
+                                failed_deletes[region].extend(batch)
+                                print(f"Failed to remove tags during rollback for batch in region {region}: {str(e)}")
+
+                    return successful_deletes, failed_deletes
+
+                def script_handler(events, context):
+                    execution_id = context['automation:EXECUTION_ID']
+                    unmanaged_instances_by_region = events['UnmanagedInstances']
+
+                    custom_tags = [
+                        {
+                            'Key': 'SSMAgentInstall-AutomationExecutionID',
+                            'Value': execution_id
+                        }
+                    ]
+                    successful_instances, failed_instances = add_tags(unmanaged_instances_by_region, custom_tags)
+                    # If any instances failed, rollback the successful ones
+                    if any(failed_instances.values()):
+                        print(f"Rolling back due to failures in creating tags.")
+                        successful_deletes, failed_deletes = delete_tags(successful_instances, custom_tags)
+
+                        return {
+                                'message': 'Tag operation failed and rolled back',
+                                'successful_deletes': successful_deletes,
+                                'failed_deletes': failed_deletes
+                            }
+                    return {
+                            'message': 'Successfully Added Tags',
+                            'successful_deletes': '',
+                            'failed_deletes': ''
+                        }
+              Runtime: python3.11
+              InputPayload:
+                UnmanagedInstances: '{{ GetInstancesFromS3.UnmanagedInstances }}'
+              Handler: script_handler
+            outputs:
+              - Type: String
+                Name: message
+                Selector: $.Payload.message
+              - Type: String
+                Name: successful_rollbacks
+                Selector: $.Payload.successful_deletes
+              - Type: String
+                Name: failed_rollbacks
+                Selector: $.Payload.failed_deletes
+          - name: executeAutomationOnProvidedTags
+            action: aws:executeAutomation
+            nextStep: UploadResultsToS3
+            isEnd: false
+            onFailure: Continue
+            inputs:
+              TargetParameterName: InstanceId
+              Targets:
+                - Values:
+                    - '{{ TargetTagValue }}'
+                  Key: '{{ TargetTagKey }}'
+              RuntimeParameters:
+                UploadLogsToS3Bucket: '{{ UploadLogsToS3Bucket }}'
+                AutomationAssumeRole: '{{ AutomationAssumeRole }}'
+                TemporaryInstanceProfileToUse: '{{ TemporaryInstanceProfileToUse }}'
+                OrchestratorAutomationID: '{{ OrchestratorAutomationID }}'
+              DocumentName: SSMAgentInstall-Secondary
+              TargetLocations:
+                - ExecutionRoleName: SSMAgentInstall-MAMR-AutomationExecutionRole
+                  Regions:
+                    - '{{ TargetRegions }}'
+                  TargetsMaxConcurrency: '40'
+                  TargetsMaxErrors: '100%'
+                  Accounts:
+                    - '{{global:ACCOUNT_ID}}'
+          - name: BranchIfTagsAdded
+            action: aws:branch
+            isEnd: true
+            inputs:
+              Choices:
+                - NextStep: executeAutomationOnInstancesS3
+                  Variable: '{{ AddTagsS3Instances.message }}'
+                  StringEquals: Successfully Added Tags
+          - name: executeAutomationOnInstancesS3
+            action: aws:executeAutomation
+            nextStep: UploadResultsToS3
+            isEnd: false
+            onFailure: Continue
+            inputs:
+              TargetParameterName: InstanceId
+              Targets:
+                - Values:
+                    - '{{ automation:EXECUTION_ID }}'
+                  Key: tag:SSMAgentInstall-AutomationExecutionID
+              RuntimeParameters:
+                UploadLogsToS3Bucket: '{{ UploadLogsToS3Bucket }}'
+                AutomationAssumeRole: '{{ AutomationAssumeRole }}'
+                TemporaryInstanceProfileToUse: '{{ TemporaryInstanceProfileToUse }}'
+                OrchestratorAutomationID: '{{ OrchestratorAutomationID }}'
+              DocumentName: SSMAgentInstall-Secondary
+              TargetLocations:
+                - ExecutionRoleName: SSMAgentInstall-MAMR-AutomationExecutionRole
+                  Regions:
+                    - '{{ GetInstancesFromS3.UnmanagedRegions}}'
+                  TargetLocationMaxConcurrency: '3'
+                  TargetsMaxConcurrency: '40'
+                  TargetsMaxErrors: '100%'
+                  Accounts:
+                    - '{{global:ACCOUNT_ID}}'
+          - name: UploadResultsToS3
+            action: aws:executeScript
+            isEnd: true
+            inputs:
+              Script: |-
+                import boto3
+                import sys
+                import subprocess
+                import json
+                import os
+                from io import StringIO
+                from datetime import datetime
+                from typing import Dict, Any
+                sys.tracebacklimit = 0
+
+                try:
+                    boto_modules = [m for m in sys.modules.keys() if m.startswith('boto')]
+                    for m in boto_modules:
+                        del(sys.modules[m])
+
+                    packages = ['boto3', 'pandas']
+                    for package in packages:
+                        subprocess.check_call([sys.executable, "-m", "pip", "install", package, "-t", "/tmp/"])
+
+                    sys.path.insert(0, '/tmp/')
+                    import pandas as pd
+
+                except Exception as e:
+                    print(f"Failed to install dependencies: {str(e)}")
+                    raise
+
+                class S3Handler:
+                    def __init__(self, bucket_name: str):
+                        self.s3_client = boto3.client('s3')
+                        self.bucket_name = bucket_name
+
+                    def save_results(self, data: Dict[str, Any], file_prefix: str, execution_id: str) -> None:
+                        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                        s3_folder_path = "SSMAgentInstallSolution-automationResults"
+
+                        try:
+                            # Save JSON
+                            json_key = f"{file_prefix}/{s3_folder_path}/{execution_id}/automation_results_{timestamp}.json"
+                            self.s3_client.put_object(
+                                Bucket=self.bucket_name,
+                                Key=json_key,
+                                Body=json.dumps(data, default=str)
+                            )
+                            print(f"JSON results saved to s3://{self.bucket_name}/{json_key}")
+
+                            # Save CSV
+                            csv_key = f"{file_prefix}/{s3_folder_path}/{execution_id}/automation_results_{timestamp}.csv"
+                            df = self.flatten_automation_data(data)
+                            csv_buffer = StringIO()
+                            df.to_csv(csv_buffer, index=False)
+                            self.s3_client.put_object(
+                                Bucket=self.bucket_name,
+                                Key=csv_key,
+                                Body=csv_buffer.getvalue(),
+                                ContentType='text/csv'
+                            )
+                            print(f"CSV results saved to s3://{self.bucket_name}/{csv_key}")
+                        except Exception as e:
+                            print(f"Error saving to S3: {str(e)}")
+                            raise
+                    @staticmethod
+                    def flatten_automation_data(json_data: Dict[str, Any]) -> pd.DataFrame:
+                        rows = []
+                        for account_region, execution_data in json_data.items():
+                            account_id, region = account_region.split('_')
+                            parent_execution_id = execution_data['ExecutionId']
+                            for nested_execution_id, nested_data in execution_data['NestedAutomations'].items():
+                                row = {
+                                    'Account_ID': account_id,
+                                    'Region': region,
+                                    'Parent_Execution_ID': parent_execution_id,
+                                    'Instance_ID': nested_data['InstanceID'],
+                                    'Nested_Execution_ID': nested_execution_id,
+                                    'Status': nested_data['Status'],
+                                    'StartTime': nested_data['StartTime'],
+                                    'EndTime': nested_data['EndTime'],
+                                    'FinalOutput': ', '.join(nested_data['Output'].get('FinalOutput.output', [])),
+                                    'ConsoleUrl': nested_data['ConsoleUrl']
+                                }
+                                rows.append(row)
+                        return pd.DataFrame(rows)
+
+                class SSMHandler:
+                    def __init__(self, ssm_client=None):
+                        self.ssm_client = ssm_client if ssm_client else boto3.client('ssm')
+
+                    def get_automation_execution(self, execution_id: str) -> Dict[str, Any]:
+                        try:
+                            response = self.ssm_client.get_automation_execution(AutomationExecutionId=execution_id)
+                            return response['AutomationExecution']
+                        except Exception as e:
+                            print(f"Error getting automation execution {execution_id}: {str(e)}")
+                            raise
+
+                    def get_nested_child_automations(self, execution: Dict[str, Any]) -> Dict[str, Any]:
+                        nested_results = {}
+                        region = self.ssm_client._client_config.region_name
+                        if 'StepExecutions' in execution:
+                            for step in execution['StepExecutions']:
+                                if 'aws:executeAutomation' in step['Action']:
+                                    child_id = step['StepExecutionId']
+                                    if child_id:
+                                        child_details = self.get_automation_execution(child_id)
+                                        if child_details:
+                                            console_url = f"https://{region}.console.aws.amazon.com/systems-manager/automation/execution/{child_id}?region={region}"
+                                            nested_results[child_id] = {
+                                                'InstanceID': step['StepName'],
+                                                'Status': child_details['AutomationExecutionStatus'],
+                                                'StepStatus': step['StepStatus'],
+                                                'StartTime': str(child_details['ExecutionStartTime']),
+                                                'EndTime': str(child_details.get('ExecutionEndTime', '')),
+                                                'Output': child_details.get('Outputs', {}),
+                                                'ConsoleUrl': console_url
+                                            }
+                        return nested_results
+
+                def compile_automation_results(ssm_handler: SSMHandler, automation_id: str) -> Dict[str, Any]:
+                    print(f"Getting details about execution id: {automation_id}")
+                    try:
+                        response = ssm_handler.get_automation_execution(automation_id)
+                        step_dict = next((step for step in response['StepExecutions']
+                                          if step['StepName'] in ['executeAutomation', 'executeAutomationOnProvidedTags', 'executeAutomationOnInstancesS3']
+                                          and step['StepStatus'] != 'Pending'), None)
+
+                        if not step_dict:
+                            raise ValueError("No relevant step found in automation execution")
+
+                        mamr_parent_execution_id = step_dict['Outputs'].get('ExecutionId', [None])[0]
+                        print(f"Parent automation execution ID for MAMR mode: {mamr_parent_execution_id}")
+
+                        parent_execution = ssm_handler.get_automation_execution(mamr_parent_execution_id)
+                        results = {}
+                        for step in parent_execution['StepExecutions']:
+                            if 'aws:executeAutomation' in step['Action']:
+                                target_account, target_region = step['StepName'].split('_')
+                                child_execution_id = step['Outputs'].get('ExecutionId', [''])[0]
+                                target_ssm = boto3.client('ssm', region_name=target_region)
+                                try:
+                                    target_region_handler = SSMHandler(target_ssm)
+                                    child_execution = target_region_handler.get_automation_execution(child_execution_id)
+                                    if child_execution:
+                                        nested_automations = target_region_handler.get_nested_child_automations(child_execution)
+                                        key = f"{target_account}_{target_region}"
+                                        results[key] = {
+                                            'ExecutionId': child_execution_id,
+                                            'Status': child_execution['AutomationExecutionStatus'],
+                                            'StepStatus': step['StepStatus'],
+                                            'StartTime': str(child_execution['ExecutionStartTime']),
+                                            'EndTime': str(child_execution.get('ExecutionEndTime', '')),
+                                            'Output': child_execution.get('Outputs', {}),
+                                            'NestedAutomations': nested_automations
+                                        }
+                                except Exception as e:
+                                    print(f"Error getting details for {target_account} in {target_region}: {str(e)}")
+                        return results
+                    except Exception as e:
+                        print(f"Error processing parent automation: {str(e)}")
+                        raise
+
+                def lambda_handler(event: Dict[str, Any], context: Any) -> None:
+                    try:
+                        s3_bucket_name = event['OutputS3Bucket']
+                        execution_id = context['automation:EXECUTION_ID']
+                        account_id = context['global:ACCOUNT_ID']
+                        orchestrator_automation_id = event['OrchestratorAutomationID']
+
+                        ssm_handler = SSMHandler()
+                        results = compile_automation_results(ssm_handler, execution_id)
+
+                        s3_handler = S3Handler(s3_bucket_name)
+                        s3_file_prefix = f"{orchestrator_automation_id}/{account_id}"
+                        s3_handler.save_results(results, s3_file_prefix, execution_id)
+
+                        print("Automation results compiled and saved successfully")
+                    except Exception as e:
+                        print(f"Lambda execution failed: {str(e)}")
+                        raise
+              Runtime: python3.11
+              InputPayload:
+                OutputS3Bucket: '{{ UploadLogsToS3Bucket }}'
+                OrchestratorAutomationID: '{{ OrchestratorAutomationID }}'
+              Handler: lambda_handler
+          - name: NoUnmanagedInstances
+            action: aws:executeScript
+            isEnd: true
+            inputs:
+              Script: |-
+                def script_handler(events, context):
+                  return {'message': 'No Unmanaged Instances found.'}
+              Runtime: python3.11
+              Handler: script_handler
+            outputs:
+              - Type: String
+                Name: message
+                Selector: $.Payload.message
+        outputs:
+          - UploadResultsToS3.OutputPayload
+          - NoUnmanagedInstances.message
+  S3AccessLogBucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      AccessControl: LogDeliveryWrite
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: ObjectWriter
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+  S3AccessLogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3AccessLogBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Sid: S3ServerAccessLogsPolicy
+          Effect: Allow
+          Principal:
+            Service: logging.s3.amazonaws.com
+          Action:
+            - s3:PutObject
+          Resource: !Sub arn:${AWS::Partition}:s3:::${S3AccessLogBucket}/*
+          Condition:
+            StringEquals:
+              aws:SourceAccount: !Ref AWS::AccountId
+  S3LogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ssm-agent-install-automation-logs-${AWS::AccountId}-${AWS::Region}
+      AccessControl: BucketOwnerFullControl
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LoggingConfiguration:
+        DestinationBucketName: !Ref S3AccessLogBucket
+  S3LogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3LogsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Sid: AllowCrossAccountReadWrite
+          Effect: Allow
+          Principal: "*"
+          Action:
+            - s3:PutObject
+            - s3:GetObject
+          Resource: !Sub arn:${AWS::Partition}:s3:::${S3LogsBucket}/*
+          Condition:
+            StringEquals:
+              aws:PrincipalOrgID: !Ref OrganizationId
+        - Sid: AllowBucketDetails
+          Effect: Allow
+          Principal: "*"
+          Action:
+            - s3:ListBucket
+            - s3:GetEncryptionConfiguration
+            - s3:GetBucketAcl
+          Resource: !Sub arn:${AWS::Partition}:s3:::${S3LogsBucket}
+          Condition:
+            StringEquals:
+              aws:PrincipalOrgID: !Ref OrganizationId
+  #---------------------------------------------------------------------------
+  # IAM role, Lambda function, and custom resource to clean up S3 buckets
+  #---------------------------------------------------------------------------
+  CRS3Cleanup:
+    Type: Custom::S3BucketCleanupFunction
+    Properties:
+      ServiceToken: !GetAtt S3BucketCleanup.Arn
+      s3BucketNames: !Sub "${S3LogsBucket},${S3AccessLogBucket}"
+  S3CleanupLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: SSMAgentInstall-S3RoleForLambda
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: LogAccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:${AWS::Partition}:logs:*:*:*
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketVersioning
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                  - s3:DeleteBucket
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3:::${S3LogsBucket}
+                  - !Sub arn:${AWS::Partition}:s3:::${S3AccessLogBucket}
+              - Effect: Allow
+                Action:
+                  - s3:DeleteObject
+                  - s3:DeleteObjectVersion
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3:::${S3LogsBucket}/*
+                  - !Sub arn:${AWS::Partition}:s3:::${S3AccessLogBucket}/*
+  S3BucketCleanup:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          #* Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+          #* SPDX-License-Identifier: MIT-0
+          #*
+          #* Permission is hereby granted, free of charge, to any person obtaining a copy of this
+          #* software and associated documentation files (the "Software"), to deal in the Software
+          #* without restriction, including without limitation the rights to use, copy, modify,
+          #* merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+          #* permit persons to whom the Software is furnished to do so.
+          #*
+          #* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+          #* INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+          #* PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+          #* HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+          #* OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+          #* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+          import cfnresponse
+          import boto3
+
+          def lambda_handler(event, context):
+            print(event)
+
+            # Globals
+            responseData = {}
+            ResponseStatus = cfnresponse.SUCCESS
+            s3BucketNamesEvent = event['ResourceProperties']['s3BucketNames']
+
+            s3BucketNames = s3BucketNamesEvent.split(",")
+
+            if event['RequestType'] == 'Create':
+              responseData['Message'] = "Resource creation successful!"
+            elif event['RequestType'] == 'Update':
+              responseData['Message'] = "Resource update successful!"
+            elif event['RequestType'] == 'Delete':
+              s3 = boto3.resource('s3')
+              s3Client = boto3.client('s3')
+
+              for s3BucketName in s3BucketNames:
+                print(s3BucketName)
+                if 'config-bucket' in s3BucketName:
+                    bucket = s3.Bucket(s3BucketName)
+                    bucketVersioning = s3.BucketVersioning(s3BucketName)
+                    if bucketVersioning.status == 'Enabled':
+                        response = bucket.object_versions.delete()
+                        print(response)
+                        bucket.objects.delete()
+                    else:
+                        bucket.objects.delete()
+                    s3Client.delete_bucket(Bucket=s3BucketName)
+                else:
+                    bucket = s3.Bucket(s3BucketName)
+                    bucketVersioning = s3.BucketVersioning(s3BucketName)
+                    if bucketVersioning.status == 'Enabled':
+                        response = bucket.object_versions.delete()
+                        print(response)
+                        bucket.objects.delete()
+                    else:
+                        bucket.objects.delete()
+              responseData['Message'] = "Resource deletion successful!"
+
+            cfnresponse.send(event, context, ResponseStatus, responseData)
+
+      Description: This function is called when CloudFormation stack is created/updated/deleted and does cleanup the S3 bucket when the CF stack is deleted.
+      FunctionName: SSMAgentInstall-Lambda-S3Cleanup
+      Handler: index.lambda_handler
+      MemorySize: 256
+      Role: !GetAtt S3CleanupLambdaExecutionRole.Arn
+      Runtime: python3.13
+      Timeout: 300
+  AutomationExecutionRoleStackSet:
+    Type: AWS::CloudFormation::StackSet
+    DependsOn: S3BucketCleanup
+    Properties:
+      AutoDeployment:
+        Enabled: true
+        RetainStacksOnAccountRemoval: false
+      CallAs: DELEGATED_ADMIN
+      StackSetName: SSMAgentInstall-StackSetforAutomationRoles
+      Parameters:
+        - ParameterKey: S3LogsBucketArn
+          ParameterValue: !GetAtt S3LogsBucket.Arn
+        - ParameterKey: AutomationAdministrationServiceRoleArn
+          ParameterValue: !GetAtt AutomationAdministrationServiceRole.Arn
+        - ParameterKey: CentralAccountID
+          ParameterValue: !Ref AWS::AccountId
+      PermissionModel: SERVICE_MANAGED
+      ManagedExecution:
+        Active: true
+      OperationPreferences:
+        ConcurrencyMode: SOFT_FAILURE_TOLERANCE
+        MaxConcurrentCount: 10
+        RegionConcurrencyType: PARALLEL
+      Capabilities:
+        - CAPABILITY_IAM
+        - CAPABILITY_NAMED_IAM
+      StackInstancesGroup:
+        - Regions:
+          - !Ref AWS::Region
+          DeploymentTargets:
+            OrganizationalUnitIds: !Ref DeploymentTargetsOUs
+      TemplateBody: |
+        Parameters:
+          S3LogsBucketArn:
+            Description: (Required) ARN of the central S3 bucket for logging.
+            Type: String
+          AutomationAdministrationServiceRoleArn:
+            Description: (Required) ARN of the automation administrator role.
+            Type: String
+          CentralAccountID:
+            Type: String
+        Resources:
+          #-------------------------------------------------------------------------------------
+          # IAM role and instance profile to temporarily attach to Instance.
+          #-------------------------------------------------------------------------------------
+          TemporaryInstanceProfilePolicy:
+            Type: AWS::IAM::Policy
+            Properties:
+              PolicyDocument:
+                Statement:
+                  - Effect: Allow
+                    Action:
+                    - s3:GetObject
+                    - s3:PutObject
+                    - s3:GetObjectAcl
+                    Resource:
+                      - !Ref S3LogsBucketArn
+                      - !Sub "${S3LogsBucketArn}/*"
+                Version: 2012-10-17
+              PolicyName: !Sub SSMAgentInstall-S3Policy-${AWS::Region}
+              Roles:
+                - !Ref TemporaryInstanceProfileRole
+
+          TemporaryInstanceProfileRole:
+            Type: AWS::IAM::Role
+            Properties:
+              AssumeRolePolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                - Effect: Allow
+                  Principal:
+                    Service:
+                    - ec2.amazonaws.com
+                  Action: sts:AssumeRole
+              ManagedPolicyArns:
+              - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+              Path: "/"
+              RoleName: SSMAgentInstall-TemporaryInstanceProfile
+
+          TemporaryInstanceProfile:
+            Type: AWS::IAM::InstanceProfile
+            Properties:
+              Path: "/"
+              Roles:
+              - !Ref TemporaryInstanceProfileRole
+              InstanceProfileName: SSMAgentInstall-TemporaryInstanceProfile
+
+          #-------------------------------------------------
+          # Automation Execution role for multi-account/Region Automation capabilities
+          #-------------------------------------------------
+          AutomationExecutionServiceRolePolicy:
+            Type: AWS::IAM::Policy
+            Properties:
+              PolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                - Effect: Allow
+                  Action:
+                    - sts:AssumeRole
+                  Resource:
+                   - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/SSMAgentInstall-MAMR-AutomationExecutionRole
+                - Effect: Allow
+                  Action:
+                    - s3:ListBucket
+                    - s3:GetObject
+                    - s3:PutObject
+                  Resource:
+                    - !Ref S3LogsBucketArn
+                    - !Sub "${S3LogsBucketArn}/*"
+                - Effect: Allow
+                  Action:
+                    - autoscaling:DescribeAutoScalingInstances
+                    - ssm:DescribeInstanceInformation
+                    - ec2:DescribeInstanceAttribute
+                    - ec2:DescribeInstances
+                    - ec2:StopInstances
+                    - ec2:StartInstances
+                    - ec2:ModifyInstanceAttribute
+                    - ssm:StartAutomationExecution
+                    - ssm:GetAutomationExecution
+                    - ssm:GetServiceSetting
+                    - ec2:DescribeIamInstanceProfileAssociations
+                    - ec2:DisassociateIamInstanceProfile
+                    - iam:ListInstanceProfilesForRole
+                    - ec2:AssociateIamInstanceProfile
+                    - ec2:CreateTags
+                    - ec2:DeleteTags
+                    - iam:AddRoleToInstanceProfile
+                    - iam:GetInstanceProfile
+                    - iam:PassRole
+                    - tag:GetResources
+                  Resource: "*"
+                - Effect: Allow
+                  Action:
+                   - resource-groups:listGroupResources
+                  Resource: "*"
+              PolicyName: SSMAgentInstall-MAMR-AutomationExecutionPolicy
+              Roles:
+                - !Ref AutomationExecutionServiceRole
+
+          AutomationExecutionServiceRole:
+            Type: AWS::IAM::Role
+            Properties:
+              AssumeRolePolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                - Effect: Allow
+                  Principal:
+                    Service:
+                      - ssm.amazonaws.com
+                    AWS:
+                      - !Ref AutomationAdministrationServiceRoleArn
+                      # - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/SSMAgentInstall-MAMR-AutomationExecutionRole'
+                      - !Sub arn:aws:iam::${AWS::AccountId}:root
+                      # - !Sub arn:aws:iam::${CentralAccountID}:root
+                  Action: sts:AssumeRole
+              ManagedPolicyArns:
+                - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonSSMAutomationRole
+              Path: "/"
+              RoleName: SSMAgentInstall-MAMR-AutomationExecutionRole
+  AutomationSSMDocumentStackSet:
+    Type: AWS::CloudFormation::StackSet
+    DependsOn: S3BucketCleanup
+    Properties:
+      AutoDeployment:
+        Enabled: true
+        RetainStacksOnAccountRemoval: false
+      CallAs: DELEGATED_ADMIN
+      StackSetName: SSMAgentInstall-StackSetforSSMDocument
+      PermissionModel: SERVICE_MANAGED
+      ManagedExecution:
+        Active: true
+      OperationPreferences:
+        ConcurrencyMode: SOFT_FAILURE_TOLERANCE
+        MaxConcurrentCount: 10
+        RegionConcurrencyType: PARALLEL
+      Capabilities:
+        - CAPABILITY_IAM
+        - CAPABILITY_NAMED_IAM
+      StackInstancesGroup:
+        - Regions: !Ref TargetRegions
+          DeploymentTargets:
+            OrganizationalUnitIds: !Ref DeploymentTargetsOUs
+      TemplateBody: |
+        AWSTemplateFormatVersion: 2010-09-09
+        Description: 'CloudFormation template to deploy SSMAgentInstall-Secondary runbook'
+        Resources:
+          SSMAutomationRunbookSecondary:
+            Type: AWS::SSM::Document
+            Properties:
+              DocumentFormat: YAML
+              DocumentType: Automation
+              Name: SSMAgentInstall-Secondary
+              Content:
+                schemaVersion: '0.3'
+                description: |-
+                  **This automation runbook will install SSM Agent on EC2 instance using userdata script.**
+                  ### Prerequisites :
+                  1. **S3 Connectivity**: The target EC2 instance must have connectivity to S3 in order to download the SSM Agent package and upload execution logs.
+                  2. **Required Dependencies**: For Linux,unzip,curl,awscli is required to download the ssm agent software. If these are not present, it will be installed.
+                assumeRole: '{{ AutomationAssumeRole }}'
+                parameters:
+                  AutomationAssumeRole:
+                    description: (Required) IAM role that allows Automation to perform the actions on your behalf.
+                    type: AWS::IAM::Role::Arn
+                  UploadLogsToS3Bucket:
+                    type: AWS::S3::Bucket::Name
+                  InstanceId:
+                    type: String
+                  TemporaryInstanceProfileToUse:
+                    type: String
+                  OrchestratorAutomationID:
+                    description: Automation Execution ID for the Orchestrator.
+                    type: String
+                mainSteps:
+                  - description: Check if Instance can be stopped.
+                    name: getInstanceProperties
+                    action: aws:executeScript
+                    timeoutSeconds: 600
+                    nextStep: branchonSSMManaged
+                    isCritical: true
+                    isEnd: false
+                    onFailure: step:HandlePrerequisiteEvaluationError
+                    inputs:
+                      Script: |-
+                        import boto3
+                        from botocore.exceptions import ClientError
+
+                        def script_handler(events,context):
+                            instance_id = events["InstanceId"]
+                            ec2 = boto3.client('ec2')
+                            autoscaling = boto3.client('autoscaling')
+                            ssm = boto3.client('ssm')
+                            user_data = ''
+                            instance_state = ''
+
+                            # Check if the instance is already managed by SSM
+                            try:
+                                response = ssm.describe_instance_information(
+                                    InstanceInformationFilterList=[
+                                        {
+                                            'key': 'InstanceIds',
+                                            'valueSet': [instance_id]
+                                        }
+                                    ]
+                                )
+                                if response['InstanceInformationList']:
+                                    return {'OriginalUserData': user_data, 'state': instance_state,'SSMManaged':'true','platform': 'Undefined', 'error': 'None'}
+                                else:
+                                    print(f'Instance {instance_id} is not managed by AWS Systems Manager.')
+                            except ClientError as e:
+                                error_message = f'Error checking instance SSM Ping Status: {e}'
+                                return {'OriginalUserData': '', 'state': '','SSMManaged':'','instance_profile': '', 'platform': '', 'error': error_message}
+
+                            try:
+                                response = ec2.describe_instances(InstanceIds=[instance_id])
+                                instance_data = response['Reservations'][0]['Instances'][0]
+                                instance_platform = instance_data.get('Platform', '')
+
+                                # Check if the instance is a spot or asg instance
+                                instance_lifecycle = instance_data.get('InstanceLifecycle', '')
+                                if instance_lifecycle == 'spot':
+                                    error_message = f"The instance {instance_id} is a spot instance. Exiting..."
+                                    return {'OriginalUserData': '', 'state': '','SSMManaged':'','instance_profile': '', 'platform': '', 'error': error_message}
+                                instances = autoscaling.describe_auto_scaling_instances(InstanceIds=[instance_id])[
+                                    "AutoScalingInstances"
+                                ]
+                                if instances and instances[0]["LifecycleState"] not in ["Standby"]:
+                                    error_message = f"The instance {instance_id} is part of an Auto Scaling group. Exiting..."
+                                    return {'OriginalUserData': '', 'state': '','SSMManaged':'','instance_profile': '', 'platform': '', 'error': error_message}
+
+                                instance_state = instance_data['State']['Name']
+                                if instance_state not in ['running']:
+                                    error_message = f"The instance {instance_id} is in an invalid state ({instance_state}).Required state is running. Exiting..."
+                                    return {'OriginalUserData': '', 'state': '','SSMManaged':'','instance_profile': '', 'platform': '', 'error': error_message}
+
+                                root_device_type = instance_data['RootDeviceType']
+                                if root_device_type != 'ebs':
+                                    error_message = f"The instance {instance_id} does not have an EBS root device. Exiting..."
+                                    return {'OriginalUserData': '', 'state': '','SSMManaged':'','instance_profile': '', 'platform': '', 'error': error_message}
+
+                                instance_shutdown_attribute = ec2.describe_instance_attribute(
+                                    InstanceId=instance_id,
+                                    Attribute='instanceInitiatedShutdownBehavior'
+                                )
+                                shutdown_behavior = instance_shutdown_attribute['InstanceInitiatedShutdownBehavior'].get('Value', None)
+                                if shutdown_behavior != 'stop':
+                                    error_message = f"The instance {instance_id} has an invalid shutdown behavior ({shutdown_behavior}) . Exiting..."
+                                    return {'OriginalUserData': '', 'state': '','SSMManaged':'','instance_profile': '', 'platform': '', 'error': error_message}
+
+                                print(f"Instance {instance_id} passed all checks.")
+
+                                if 'IamInstanceProfile' in response['Reservations'][0]['Instances'][0]:
+                                    instance_profile_name = response['Reservations'][0]['Instances'][0]['IamInstanceProfile']['Arn'].split('instance-profile/')[1]
+                                else:
+                                    instance_profile_name = 'NoRoleFound'
+
+                                # Get current Userdata
+                                instance_userdata = ec2.describe_instance_attribute(
+                                    InstanceId=instance_id,
+                                    Attribute='userData'
+                                )
+                                user_data = instance_userdata['UserData'].get('Value', '')
+
+                                return {'OriginalUserData': user_data, 'state': instance_state,'SSMManaged':'false','instance_profile': instance_profile_name, 'platform': instance_platform, 'error': 'None'}
+
+                            except ClientError as e:
+                                error_message = f"Error checking instance properties: {e}"
+                                return {'OriginalUserData': '', 'state': '','SSMManaged':'','instance_profile': '', 'platform': '', 'error': error_message}
+                      Runtime: python3.11
+                      InputPayload:
+                        InstanceId: '{{ InstanceId }}'
+                      Handler: script_handler
+                    outputs:
+                      - Type: String
+                        Name: OriginalUserData
+                        Selector: $.Payload.OriginalUserData
+                      - Type: String
+                        Name: state
+                        Selector: $.Payload.state
+                      - Type: String
+                        Name: SSMManaged
+                        Selector: $.Payload.SSMManaged
+                      - Type: String
+                        Name: InstanceProfileName
+                        Selector: $.Payload.instance_profile
+                      - Type: String
+                        Name: instance_platform
+                        Selector: $.Payload.platform
+                      - Type: String
+                        Name: error
+                        Selector: $.Payload.error
+                  - name: HandlePrerequisiteEvaluationError
+                    action: aws:executeScript
+                    nextStep: FinalOutput
+                    isEnd: false
+                    inputs:
+                      Script: |-
+                        def script_handler(events, context):
+                          original_state = events['OriginalState']
+                          prerequisite_step_error = events['Error']
+                          message = f"[SKIPPED]: Instance does not meet the prerequisites: {prerequisite_step_error}"
+                          return {'message': message}
+                      Runtime: python3.11
+                      InputPayload:
+                        OriginalState: '{{ getInstanceProperties.state }}'
+                        Error: '{{ getInstanceProperties.error }}'
+                      Handler: script_handler
+                    outputs:
+                      - Type: String
+                        Name: message
+                        Selector: $.Payload.message
+                  - name: branchonSSMManaged
+                    action: aws:branch
+                    inputs:
+                      Choices:
+                        - NextStep: HandlePrerequisiteEvaluationError
+                          Not:
+                            Variable: '{{ getInstanceProperties.error }}'
+                            StringEquals: 'None'
+                        - NextStep: FinalOutput
+                          Not:
+                            Variable: '{{ getInstanceProperties.SSMManaged }}'
+                            StringEquals: 'false'
+                      Default: StopInstance
+                  - name: StopInstance
+                    action: aws:changeInstanceState
+                    nextStep: UpdateUserdata
+                    isEnd: false
+                    onFailure: step:HandleStopInstanceError
+                    inputs:
+                      Force: true
+                      DesiredState: stopped
+                      InstanceIds:
+                        - '{{ InstanceId }}'
+                      CheckStateOnly: false
+                  - description: Update the userdata property for the instance.
+                    name: UpdateUserdata
+                    action: aws:executeScript
+                    timeoutSeconds: 600
+                    nextStep: AttachTemporaryInstanceProfile
+                    isCritical: true
+                    isEnd: false
+                    onFailure: Abort
+                    inputs:
+                      Script: |-
+                        import base64
+                        import re
+                        import boto3
+
+                        def script_handler(events, context):
+                            s3_bucket = events["s3bucket"]
+                            instance = events["instance"]
+                            region = context.get("global:REGION")
+                            automation_id = context.get("automation:EXECUTION_ID")
+                            account_id = context.get("global:ACCOUNT_ID")
+                            orchestrator_automation_id = events["orchestrator_id"]
+
+                            os_platform = events["platform"]
+
+                            def update_userdata_script(original_script, s3_bucket, region, automation_id, instance, os_platform):
+                                if os_platform.lower() == 'windows':
+                                    # Windows platform replacements
+                                    replacements = {
+                                        '^S3_BUCKET^': s3_bucket,
+                                        '^REGION^': region,
+                                        '^AUTOMATION_ID^': automation_id,
+                                        '^INSTANCE_ID^': instance,
+                                        '^ACCOUNT_ID^': account_id,
+                                        '^ORCHESTRATOR_AUTOMATION_ID^': orchestrator_automation_id
+                                    }
+                                    updated_script = original_script
+                                    for old, new in replacements.items():
+                                      updated_script = updated_script.replace(old, new)
+                                else:
+                                    script = base64.b64decode(original_script).decode('utf-8')
+                                    # Linux platform replacements
+                                    script = re.sub(r'S3_BUCKET="(.*?)"', f'S3_BUCKET="{s3_bucket}"', script)
+                                    script = re.sub(r'REGION="(.*?)"', f'REGION="{region}"', script)
+                                    script = re.sub(r'AUTOMATION_ID="(.*?)"', f'AUTOMATION_ID="{automation_id}"', script)
+                                    script = re.sub(r'INSTANCE_ID="(.*?)"', f'INSTANCE_ID="{instance}"', script)
+                                    script = re.sub(r'ORCHESTRATOR_AUTOMATION_ID="(.*?)"', f'ORCHESTRATOR_AUTOMATION_ID="{orchestrator_automation_id}"', script)
+                                    script = re.sub(r'ACCOUNT_ID="(.*?)"', f'ACCOUNT_ID="{account_id}"', script)
+                                    # Encode back to base64
+                                    updated_script = base64.b64encode(script.encode('utf-8')).decode('utf-8')
+                                return updated_script
+
+                            lin_base64_script = "Q29udGVudC1UeXBlOiBtdWx0aXBhcnQvbWl4ZWQ7IGJvdW5kYXJ5PSIvLyIKTUlNRS1WZXJzaW9uOiAxLjAKCi0tLy8KQ29udGVudC1UeXBlOiB0ZXh0L2Nsb3VkLWNvbmZpZzsgY2hhcnNldD0idXMtYXNjaWkiCk1JTUUtVmVyc2lvbjogMS4wCkNvbnRlbnQtVHJhbnNmZXItRW5jb2Rpbmc6IDdiaXQKQ29udGVudC1EaXNwb3NpdGlvbjogYXR0YWNobWVudDsKIGZpbGVuYW1lPSJjbG91ZC1jb25maWcudHh0IgoKI2Nsb3VkLWNvbmZpZwpjbG91ZF9maW5hbF9tb2R1bGVzOgotIFtzY3JpcHRzLXVzZXIsIGFsd2F5c10KLS0vLwpDb250ZW50LVR5cGU6IHRleHQveC1zaGVsbHNjcmlwdDsgY2hhcnNldD0idXMtYXNjaWkiCk1JTUUtVmVyc2lvbjogMS4wCkNvbnRlbnQtVHJhbnNmZXItRW5jb2Rpbmc6IDdiaXQKQ29udGVudC1EaXNwb3NpdGlvbjogYXR0YWNobWVudDsgZmlsZW5hbWU9InVzZXJkYXRhLnR4dCIKCiMhL2Jpbi9iYXNoCnNldCAtZQoKcGFja2FnZV9leGlzdHMoKSB7CiAgICAkKHdoaWNoICIkMSIgPiAvZGV2L251bGwgMj4mMSApCiAgICByZXR1cm4gJD8KfQoKIyBGdW5jdGlvbiB0byBpbnN0YWxsIEFXUyBDTEkKaW5zdGFsbF9hd3NfY2xpKCkgewogIGlmIHBhY2thZ2VfZXhpc3RzIGF3czsgdGhlbgogICAgZWNobyAiQVdTIENMSSBpcyBhbHJlYWR5IGluc3RhbGxlZC4iID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgZWxzZQogICAgZWNobyAiSW5zdGFsbGluZyBBV1MgQ0xJLi4uIgogICAgY3VybCAtbyAiYXdzY2xpdjIuemlwIiAiaHR0cHM6Ly9hd3NjbGkuYW1hem9uYXdzLmNvbS9hd3NjbGktZXhlLWxpbnV4LXg4Nl82NC56aXAiID4gL2Rldi9udWxsIDI+JjEKICAgIHVuemlwIGF3c2NsaXYyLnppcCA+IC9kZXYvbnVsbCAyPiYxCiAgICBzdWRvIC4vYXdzL2luc3RhbGwgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEggPiAvZGV2L251bGwgMj4mMQogICAgZWNobyAiIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogIGZpCn0KCmluc3RhbGxfZGVwZW5kZW5jaWVzKCkgewogIGxvY2FsIGRlcGVuZGVuY2llcz0oIiRAIikKICBsb2NhbCBtaXNzaW5nX2RlcHM9KCkKCiAgZm9yIGRlcCBpbiAiJHtkZXBlbmRlbmNpZXNbQF19IjsgZG8KICAgIGlmICEgcGFja2FnZV9leGlzdHMgIiRkZXAiOyB0aGVuCiAgICAgIG1pc3NpbmdfZGVwcys9KCIkZGVwIikKICAgIGZpCiAgZG9uZQoKICBpZiBbICR7I21pc3NpbmdfZGVwc1tAXX0gLWVxIDAgXTsgdGhlbgogICAgZWNobyAiQWxsIGRlcGVuZGVuY2llcyByZXF1aXJlZCBhcmUgYWxyZWFkeSBpbnN0YWxsZWQuIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgcmV0dXJuCiAgZmkKCiAgaWYgcGFja2FnZV9leGlzdHMgeXVtOyB0aGVuCiAgICBlY2hvICJJbnN0YWxsaW5nIG1pc3NpbmcgZGVwZW5kZW5jaWVzIHZpYSB5dW0gY29tbWFuZDogJHttaXNzaW5nX2RlcHNbKl19IgogICAgeXVtIGluc3RhbGwgLXkgIiR7bWlzc2luZ19kZXBzW0BdfSIKICAgIGlmIFsgJD8gLW5lIDAgXTsgdGhlbgogICAgICAgIGVjaG8gIkVycm9yOiBGYWlsZWQgdG8gaW5zdGFsbCBkZXBlbmRlbmNpZXMuIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgZmkKICAgIHl1bSBjbGVhbiBhbGwgPiAvZGV2L251bGwgMj4mMQogIGVsaWYgcGFja2FnZV9leGlzdHMgenlwcGVyOyB0aGVuCiAgICBlY2hvICJJbnN0YWxsaW5nIG1pc3NpbmcgZGVwZW5kZW5jaWVzIHZpYSB6eXBwZXIgY29tbWFuZDogJHttaXNzaW5nX2RlcHNbKl19IgogICAgenlwcGVyIC1uIGluc3RhbGwgIiR7bWlzc2luZ19kZXBzW0BdfSIKICAgIGlmIFsgJD8gLW5lIDAgXTsgdGhlbgogICAgICAgIGVjaG8gIkVycm9yOiBGYWlsZWQgdG8gaW5zdGFsbCBkZXBlbmRlbmNpZXMgdXNpbmcgenlwcGVyLiIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgIGZpCiAgZWxzZQogICAgZWNobyAiSW5zdGFsbGluZyBtaXNzaW5nIGRlcGVuZGVuY2llcyB2aWEgYXB0LWdldCBjb21tYW5kOiAke21pc3NpbmdfZGVwc1sqXX0iCiAgICBhcHQtZ2V0IHVwZGF0ZSAmJiBhcHQtZ2V0IGluc3RhbGwgLXkgIiR7bWlzc2luZ19kZXBzW0BdfSIKICAgIGlmIFsgJD8gLW5lIDAgXTsgdGhlbgogICAgICAgIGVjaG8gIkVycm9yOiBGYWlsZWQgdG8gaW5zdGFsbCBkZXBlbmRlbmNpZXMgdXNpbmcgQXB0LiIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgIGZpCiAgZmkKfQoKCmdldF9hcmNoKCkgewogICAgbG9jYWwgYXJjaF91bmFtZQogICAgYXJjaF91bmFtZT0kKHVuYW1lIC1tKQogICAgY2FzZSAkYXJjaF91bmFtZSBpbgogICAgIng4Nl82NCIpCiAgICAgICAgYXJjaD0iYW1kNjQiCiAgICAgICAgcmV0dXJuIDAKICAgICAgICA7OwogICAgImFhcmNoNjQiKQogICAgICAgIGFyY2g9ImFybTY0IgogICAgICAgIHJldHVybiAwCiAgICAgICAgOzsKICAgICopCiAgICAgICAgZWNobyAiVW5rbm93biBBcmNoaXRlY2h0dXJlIGZvdW5kOiAkYXJjaF91bmFtZSIKICAgICAgICBleGl0IDEKICAgICAgICA7OwogICAgZXNhYwp9CgpnZXRfcGFja2FnZV9tYW5hZ2VyKCkgewogICAgaWYgY29tbWFuZCAtdiBzbmFwOyB0aGVuCiAgICAgICAgcGFja2FnZV9tYW5hZ2VyPSJzbmFwIgogICAgZWxpZiBjb21tYW5kIC12IGRwa2c7IHRoZW4KICAgICAgICBwYWNrYWdlX21hbmFnZXI9ImRwa2ciCiAgICBlbGlmIGNvbW1hbmQgLXYgZG5mOyB0aGVuCiAgICAgICAgcGFja2FnZV9tYW5hZ2VyPSJkbmYiCiAgICBlbGlmIGNvbW1hbmQgLXYgeXVtOyB0aGVuCiAgICAgICAgcGFja2FnZV9tYW5hZ2VyPSJ5dW0iCiAgICBlbGlmIGNvbW1hbmQgLXYgenlwcGVyOyB0aGVuCiAgICAgICAgcGFja2FnZV9tYW5hZ2VyPSJ6eXBwZXIiCiAgICBlbHNlCiAgICAgICAgZWNobyAiTm8gU3VwcG9ydGVkIFBhY2thZ2UgTWFuYWdlciBGb3VuZCIKICAgICAgICBleGl0IDEKICAgIGZpCiAgICByZXR1cm4gMAp9CgpnZXRfc2VydmljZV9tYW5hZ2VyKCkgewogICAgaWYgY29tbWFuZCAtdiBzeXN0ZW1jdGw7IHRoZW4KICAgICAgICBzZXJ2aWNlX21hbmFnZXI9InN5c3RlbWN0bCIKICAgIGVsaWYgY29tbWFuZCAtdiBpbml0Y3RsOyB0aGVuCiAgICAgICAgc2VydmljZV9tYW5hZ2VyPSJpbml0Y3RsIgogICAgZWxzZQogICAgICAgIGVjaG8gIk5vIFN1cHBvcnRlZCBTZXJ2aWNlIE1hbmFnZXIgRm91bmQiID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICAgICAgZXhpdCAxCiAgICBmaQogICAgcmV0dXJuIDAKfQoKZ2V0X3NzbV9hZ2VudF9zZXJ2aWNlKCkgewogICAgaWYgWyAiJHBhY2thZ2VfbWFuYWdlciIgPSAic25hcCIgXTsgdGhlbgogICAgICAgIHNzbV9hZ2VudF9zZXJ2aWNlPSJzbmFwLmFtYXpvbi1zc20tYWdlbnQuYW1hem9uLXNzbS1hZ2VudCIKICAgIGVsc2UKICAgICAgICBzc21fYWdlbnRfc2VydmljZT0iYW1hem9uLXNzbS1hZ2VudCIKICAgIGZpCiAgICByZXR1cm4gMAp9Cgpzc21faXNfYWxyZWFkeV9pbnN0YWxsZWQoKSB7CiAgICBpZiBbICIkcGFja2FnZV9tYW5hZ2VyIiA9ICJ5dW0iIF0gfHwgWyAiJHBhY2thZ2VfbWFuYWdlciIgPSAienlwcGVyIiBdIHx8IFsgIiRwYWNrYWdlX21hbmFnZXIiID0gImRuZiIgXTsgdGhlbgogICAgICAgIGlmIHJwbSAtcSBhbWF6b24tc3NtLWFnZW50OyB0aGVuCiAgICAgICAgICAgIGVjaG8gIlNTTSBBZ2VudCBpcyBhbHJlYWR5IGluc3RhbGxlZCIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgICAgICAgICAgcmV0dXJuIDAKICAgICAgICBmaQogICAgICAgIHJldHVybiAxCiAgICBlbGlmIFsgIiRwYWNrYWdlX21hbmFnZXIiID0gInNuYXAiIF07IHRoZW4KICAgICAgICBpZiBzbmFwIGxpc3QgYW1hem9uLXNzbS1hZ2VudDsgdGhlbgogICAgICAgICAgICBlY2hvICJTU00gQWdlbnQgaXMgYWxyZWFkeSBpbnN0YWxsZWQiID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICAgICAgICAgIHJldHVybiAwCiAgICAgICAgZmkKICAgICAgICByZXR1cm4gMQogICAgZWxpZiBbICIkcGFja2FnZV9tYW5hZ2VyIiA9ICJkcGtnIiBdOyB0aGVuCiAgICAgICAgaWYgWyAkKGRwa2ctcXVlcnkgLVcgLWY9JyR7U3RhdHVzfScgYW1hem9uLXNzbS1hZ2VudCAyPi9kZXYvbnVsbCB8IGdyZXAgLWMgIm9rIGluc3RhbGxlZCIpIC1uZSAwIF07IHRoZW4KICAgICAgICAgICAgZWNobyAiU1NNIEFnZW50IGlzIGFscmVhZHkgaW5zdGFsbGVkIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgICAgICAgICByZXR1cm4gMAoKICAgICAgICBmaQogICAgICAgIHJldHVybiAxCiAgICBlbHNlCiAgICAgICAgZWNobyAiTm8gU3VwcG9ydGVkIFBhY2thZ2UgTWFuYWdlciBGb3VuZC4gRXhpdGluZy4uIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgICAgIGV4aXQgMQogICAgZmkKfQoKc3RhcnRfc3NtX2FnZW50KCkgewogICAgaWYgWyAtbiAiJHNlcnZpY2VfbWFuYWdlciIgXSAmJiBbIC1uICIkc3NtX2FnZW50X3NlcnZpY2UiIF07IHRoZW4KICAgICAgICBzdWRvICIkc2VydmljZV9tYW5hZ2VyIiBzdGFydCAiJHNzbV9hZ2VudF9zZXJ2aWNlIgogICAgICAgIHJldHVybiAkPwogICAgZWxzZQogICAgICAgIHJldHVybiAxCiAgICBmaQp9CgppbnN0YWxsX3NzbV9hZ2VudCgpIHsKICAgIGlmIFsgIiRwYWNrYWdlX21hbmFnZXIiID0gInNuYXAiIF07IHRoZW4KICAgICAgICBzdWRvIHNuYXAgaW5zdGFsbCBhbWF6b24tc3NtLWFnZW50IC0tY2xhc3NpYyA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgICAgIHJldHVybiAwCiAgICBmaQoKICAgIGlmIFsgIiRwYWNrYWdlX21hbmFnZXIiID0gImRwa2ciIF07IHRoZW4KICAgICAgICBsb2NhbCBzc21faW5zdGFsbF91cmw9aHR0cHM6Ly9zMy5hbWF6b25hd3MuY29tL2VjMi1kb3dubG9hZHMtd2luZG93cy9TU01BZ2VudC9sYXRlc3QvZGViaWFuXyR7YXJjaH0vYW1hem9uLXNzbS1hZ2VudC5kZWIKICAgICAgICBsb2NhbCBkZWJfaW5zdGFsbGVyX2xvY2F0aW9uPS90bXAvYW1hem9uLXNzbS1hZ2VudC5kZWIKICAgICAgICBjdXJsIC0tcmV0cnkgMyAtbyAiJHtkZWJfaW5zdGFsbGVyX2xvY2F0aW9ufSIgIiR7c3NtX2luc3RhbGxfdXJsfSIKICAgICAgICAgICAgaWYgWyAhIC1mICIke2RlYl9pbnN0YWxsZXJfbG9jYXRpb259IiBdOyB0aGVuCiAgICAgICAgICAgICAgICBlY2hvICJGYWlsZWQgdG8gZG93bmxvYWQgU1NNIEFnZW50IERlYiBpbnN0YWxsZXI6ICR7c3NtX2luc3RhbGxfdXJsfSIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgICAgICAgICAgICAgIGV4aXQgMQogICAgICAgICAgICBmaQogICAgZWxzZQogICAgICAgIGxvY2FsIHNzbV9pbnN0YWxsX3VybD1odHRwczovL3MzLmFtYXpvbmF3cy5jb20vZWMyLWRvd25sb2Fkcy13aW5kb3dzL1NTTUFnZW50L2xhdGVzdC9saW51eF8ke2FyY2h9L2FtYXpvbi1zc20tYWdlbnQucnBtCiAgICAgICAgbG9jYWwgcnBtX2luc3RhbGxlcl9sb2NhdGlvbj0vdG1wL2FtYXpvbi1zc20tYWdlbnQucnBtCiAgICAgICAgY3VybCAtLXJldHJ5IDMgLW8gIiR7cnBtX2luc3RhbGxlcl9sb2NhdGlvbn0iICIke3NzbV9pbnN0YWxsX3VybH0iCiAgICAgICAgaWYgWyAhIC1mICIke3JwbV9pbnN0YWxsZXJfbG9jYXRpb259IiBdOyB0aGVuCiAgICAgICAgICAgIGVjaG8gIkZhaWxlZCB0byBkb3dubG9hZCBTU00gQWdlbnQgUlBNIGluc3RhbGxlcjogJHtzc21faW5zdGFsbF91cmx9IiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgICAgICAgICBleGl0IDEKICAgICAgICBmaQogICAgZmkKCgogICAgaWYgWyAiJHBhY2thZ2VfbWFuYWdlciIgPSAienlwcGVyIiBdOyB0aGVuCiAgICAgICAgc3VkbyB6eXBwZXIgLS1ub24taW50ZXJhY3RpdmUgLS1uby1ncGctY2hlY2tzIGluc3RhbGwgJHtycG1faW5zdGFsbGVyX2xvY2F0aW9ufQogICAgICAgIGlmIFsgJD8gLW5lIDAgXTsgdGhlbgogICAgICAgICAgICBlY2hvICJFcnJvcjogRmFpbGVkIHRvIGluc3RhbGwgcGFja2FnZSB1c2luZyB6eXBwZXIuIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgICAgICAgICBleGl0IDEKICAgICAgICBmaQogICAgZWxpZiBbICIkcGFja2FnZV9tYW5hZ2VyIiA9ICJkbmYiIF07IHRoZW4KICAgICAgICBzdWRvIGRuZiBpbnN0YWxsIC15ICR7cnBtX2luc3RhbGxlcl9sb2NhdGlvbn0KICAgICAgICBpZiBbICQ/IC1uZSAwIF07IHRoZW4KICAgICAgICAgICAgZWNobyAiRXJyb3I6IEZhaWxlZCB0byBpbnN0YWxsIHBhY2thZ2UgdXNpbmcgZG5mLiIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgICAgICAgICAgZXhpdCAxCiAgICAgICAgZmkKCiAgICBlbGlmIFsgIiRwYWNrYWdlX21hbmFnZXIiID0gInl1bSIgXTsgdGhlbgogICAgICAgIHN1ZG8geXVtIGxvY2FsaW5zdGFsbCAteSAke3JwbV9pbnN0YWxsZXJfbG9jYXRpb259CiAgICAgICAgaWYgWyAkPyAtbmUgMCBdOyB0aGVuCiAgICAgICAgICAgIGVjaG8gIkVycm9yOiBGYWlsZWQgdG8gaW5zdGFsbCBwYWNrYWdlIHVzaW5nIHl1bS4iID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICAgICAgICAgIGV4aXQgMQogICAgICAgIGZpCiAgICBlbGlmIFsgIiRwYWNrYWdlX21hbmFnZXIiID0gImRwa2ciIF07IHRoZW4KICAgICAgICBzdWRvIGRwa2cgLWkgJHtkZWJfaW5zdGFsbGVyX2xvY2F0aW9ufQogICAgICAgIGlmIFsgJD8gLW5lIDAgXTsgdGhlbgogICAgICAgICAgICBlY2hvICJFcnJvcjogRmFpbGVkIHRvIGluc3RhbGwgcGFja2FnZSB1c2luZyBkcGtnLiIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgICAgICAgICAgZXhpdCAxCiAgICAgICAgZmkKICAgIGVsc2UKICAgICAgICBlY2hvICJObyBTdXBwb3J0ZWQgUGFja2FnZSBNYW5hZ2VyIEZvdW5kIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgICAgIGV4aXQgMQogICAgZmkKICAgIHN1ZG8gc3lzdGVtY3RsIGVuYWJsZSBhbWF6b24tc3NtLWFnZW50CiAgICBlY2hvICJTdWNjZXNzZnVsbHkgSW5zdGFsbGVkIFNTTSBBZ2VudC4iID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICBycG0gLXFhIHwgZ3JlcCBhbWF6b24tc3NtLWFnZW50ICA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgcmV0dXJuIDAKfQoKIyMjIyMjIyMjIyMjIyMgU1RBUlQgIyMjIyMjIyMjIyMjIyMKZWNobyAiU1NNIEFnZW50IEluc3RhbGxhdGlvbiBVc2VyZGF0YSBTY3JpcHQgZXhlY3V0aW9uIHN0YXJ0ZWQuLiIKUzNfQlVDS0VUPSIiClJFR0lPTj0iIgpBVVRPTUFUSU9OX0lEPSIiCklOU1RBTkNFX0lEPSIiCkFDQ09VTlRfSUQ9IiIKT1JDSEVTVFJBVE9SX0FVVE9NQVRJT05fSUQ9IiIKTE9HX0RJUj0iL3Zhci9sb2cvVXNlcmRhdGFTU01BZ2VudEluc3RhbGxhdGlvbiIKVVBMT0FEX0xPQ0FUSU9OPSJzMzovLyRTM19CVUNLRVQvJHtPUkNIRVNUUkFUT1JfQVVUT01BVElPTl9JRH0vdXNlcmRhdGFleGVjdXRpb25sb2dzLyRBQ0NPVU5UX0lELyRSRUdJT04vJHtJTlNUQU5DRV9JRH0vJHtBVVRPTUFUSU9OX0lEfSIKRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSD0iJHtMT0dfRElSfS9sb2dzLnR4dCIKc3VkbyBta2RpciAtcCAke0xPR19ESVJ9CmVjaG8gIkRpcmVjdG9yeSAvdmFyL2xvZy9Vc2VyZGF0YVNTTUFnZW50SW5zdGFsbGF0aW9uLyBjcmVhdGVkIHRvIHN0b3JlIGxvZ3MuIiA+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICmVjaG8gIkRpcmVjdG9yeSAvdmFyL2xvZy9Vc2VyZGF0YVNTTUFnZW50SW5zdGFsbGF0aW9uLyBjcmVhdGVkIHRvIHN0b3JlIGxvZ3MuIgoKc2xlZXAgMwpnZXRfYXJjaApnZXRfcGFja2FnZV9tYW5hZ2VyCmdldF9zZXJ2aWNlX21hbmFnZXIKZ2V0X3NzbV9hZ2VudF9zZXJ2aWNlCgppbnN0YWxsX2RlcGVuZGVuY2llcyBjdXJsIHVuemlwCmluc3RhbGxfYXdzX2NsaQppZiAhIHNzbV9pc19hbHJlYWR5X2luc3RhbGxlZDsgdGhlbgogICAgaW5zdGFsbF9zc21fYWdlbnQKZmkKc3RhcnRfc3NtX2FnZW50CgplY2hvICIiID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICmVjaG8gIiMjIyMgUG9zdCBJbnN0YWxsYXRpb24gQ2hlY2sgIyMjIyIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKZWNobyAiIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAojIFJ1biBkaWFnbm9zdGljcyBhbmQgc2F2ZSBvdXRwdXQKZGlhZ25vc3RpY3Nfb3V0cHV0PSQoc3NtLWNsaSBnZXQtZGlhZ25vc3RpY3MgMj4mMSkKWyAkPyAtbmUgMCBdICYmIGVjaG8gIkVycm9yIHJ1bm5pbmcgc3NtLWNsaSBnZXQtZGlhZ25vc3RpY3M6ICRkaWFnbm9zdGljc19vdXRwdXQiID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICgpmYWlsZWQ9MAoKdmFsaWRhdGVfY2hlY2tzX3N0YXR1cygpIHsKICAgIGxvY2FsIHBhdHRlcm49IiQxIgogICAgbG9jYWwgbWVzc2FnZT0iJDIiCgogICAgaWYgZWNobyAiJGRpYWdub3N0aWNzX291dHB1dCIgfCBncmVwIC1BIDIgIiRwYXR0ZXJuIiB8IGdyZXAgLXEgJyJTdGF0dXMiOiAiRmFpbGVkIic7IHRoZW4KICAgICAgICBpZiBbWyAiJHBhdHRlcm4iID09ICciQ29ubmVjdGl2aXR5IHRvIHNzbSBlbmRwb2ludCInIF1dOyB0aGVuCiAgICAgICAgICAgIGxvY2FsIG5vdGU9JChlY2hvICIkZGlhZ25vc3RpY3Nfb3V0cHV0IiB8IGdyZXAgLUEgMyAiJHBhdHRlcm4iIHwgZ3JlcCAtbyAnIk5vdGUiOiAiW14iXSoiJyB8IGhlYWQgLTEgfCBjdXQgLWQnIicgLWY0KQogICAgICAgICAgICBbWyAtbiAiJG5vdGUiIF1dICYmIG1lc3NhZ2U9IiRtZXNzYWdlIE5vdGU6ICRub3RlIgogICAgICAgIGZpCiAgICAgICAgZWNobyAiW0ZBSUxFRF06ICRtZXNzYWdlIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgICAgIGZhaWxlZD0xCiAgICBmaQp9Cgp2YWxpZGF0ZV9jaGVja3Nfc3RhdHVzICciQ29ubmVjdGl2aXR5IHRvIHNzbSBlbmRwb2ludCInICJDb25uZWN0aXZpdHkgdG8gc3NtIGVuZHBvaW50LiIKdmFsaWRhdGVfY2hlY2tzX3N0YXR1cyAnIkNoZWNrIjogIkFnZW50IHNlcnZpY2UiJyAiQWdlbnQgc2VydmljZSBpcyBub3QgcnVubmluZy4iCnZhbGlkYXRlX2NoZWNrc19zdGF0dXMgJyJFQzIgSU1EUyInICJDb25uZWN0aXZpdHkgdG8gRUMyIElNRFMgZW5kcG9pbnQuIgoKIyBQcmludCBzdWNjZXNzIG1lc3NhZ2UgaWYgbm8gZmFpbHVyZXMKWyAkZmFpbGVkIC1lcSAwIF0gJiYgZWNobyAiW1NVQ0NFU1NdIHNzbS1jbGkgc2hvd2VkIGFnZW50IGlzIHJ1bm5pbmcgYW5kIGNvbm5lY3Rpdml0eSB0byBzc20gZW5kcG9pbnQgcGFzc2VkIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAoKaWYgWyAtZiAiJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgiIF07IHRoZW4KICAgICMgVXBsb2FkIHRoZSBmaWxlIHRvIFMzCiAgICBhd3MgczMgY3AgIiRMT0dfRElSIiAiJFVQTE9BRF9MT0NBVElPTiIgLS1yZWN1cnNpdmUgLS1yZWdpb24gJFJFR0lPTiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSCAyPiYxCgogICAgIyBWYWxpZGF0ZSB0aGUgdXBsb2FkCiAgICBpZiBbICQ/IC1lcSAwIF07IHRoZW4KICAgICAgICBlY2hvICJGaWxlIHVwbG9hZCB0byBTMyBzdWNjZXNzZnVsLiIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgIGVsc2UKICAgICAgICBlY2hvICJGaWxlIHVwbG9hZCB0byBTMyBmYWlsZWQuIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgZmkKZWxzZQogICAgZWNobyAiRmlsZSBub3QgZm91bmQgdG8gdXBsb2FkOiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSCIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKZmkKCgotLS8vLS0="
+
+                            win_base64_script = '''<persist>true</persist>
+                        <powershell>
+                        Function Write-Log {
+                                [CmdletBinding()]
+                                param (
+                                        [Parameter(Mandatory = $true)]
+                                        $Message,
+                                        [ValidateSet('INFO', 'WARN', 'ERROR', 'DEBUG')]
+                                        $LogLevel = 'INFO'
+                                )
+
+                                $timestamp = Get-Date -Format o
+                                Write-Host "[$($timestamp)] [$($LogLevel)] $($Message) "
+
+                        }
+
+                        Function Get-ServiceAvailability {
+                                [CmdletBinding()]
+                                param (
+                                        [String]$ServiceName = "amazonssmagent"
+                                )
+
+                                $Service = Get-Service $ServiceName -ErrorAction SilentlyContinue
+
+                                if ($Service) {
+                                        if ($Service.Status -ne "Running") {
+                                                Write-Log -Message "$ServiceName service is not in Running state. Starting the service" -LogLevel "ERROR"
+                                                Start-Service -Name $ServiceName
+                                        }
+                                        Get-ServiceStartupMode
+                                        return 1
+                                }
+                                else {
+                                        Write-Log -Message "The $ServiceName service is not available." -LogLevel "ERROR"
+                                }
+                        }
+
+                        Function Get-ServiceStartupMode {
+                                [CmdletBinding()]
+                                param (
+                                        [String]$ServiceName = "amazonssmagent"
+                                )
+
+                                $ServiceStartupMode = (Get-WmiObject Win32_Service -Filter "Name='$ServiceName'").StartMode
+                                if ($ServiceStartupMode -ne "Auto") {
+                                        Write-Log -Message "$ServiceName startup mode is not Automatic. Updating the starting mode to Automatic. " -LogLevel "ERROR"
+                                        Set-Service -Name $ServiceName -StartupType "Automatic"
+                                }
+                        }
+
+                        Function Install-SsmAgent {
+                                [CmdletBinding()]
+                                param (
+                                        [String]$ParentDirectory
+                                )
+
+                                cd $ParentDirectory
+                                (New-Object System.Net.WebClient).DownloadFile("https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/windows_amd64/AmazonSSMAgentSetup.exe", $ParentDirectory + "\AmazonSSMAgentSetup.exe")
+                                Start-Process .\AmazonSSMAgentSetup.exe -ArgumentList @("/q", "/log", "install.log") -Wait
+                                $ServiceAvailability = Get-ServiceAvailability
+                                if ($ServiceAvailability -ne 1) {
+                                        Write-Output "Installation of the SSM Agent failed. Please review the logs in $ParentDirectory\log"
+                                }
+                                else {
+                                        Write-Log -Message "Successfully Installed SSM Agent."
+                                }
+                        }
+
+                        Function Test-AWSPowerShellWriteS3ObjectCommand {
+                                try {
+                                    $ErrorActionPreference = 'Stop'
+                                    $writeS3ObjectCommand = Get-Command Write-S3Object
+
+                                    if ($?) {
+                                        return $true
+                                    } else {
+                                        Write-Log -Message "Get-Command failed silently" -LogLevel "ERROR"
+                                        return $false
+                                    }
+                                }
+                                catch {
+                                    Write-Log -Message "Error checking Write-S3Object command: $($_.Exception.Message)" -LogLevel "ERROR"
+                                    return $false
+                                }
+                                finally {
+                                    $ErrorActionPreference = 'Continue'
+                                }
+                            }
+
+                        Function Install-AWSPowerShellS3Module {
+                                # Check if NuGet provider is installed (required for PowerShell Gallery)
+                                if (-not (Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
+                                        try {
+                                                Install-PackageProvider -Name NuGet -Force
+                                                Write-Log -Message "NuGet provider installed successfully"
+                                        }
+                                        catch {
+                                                Write-Log -Message "Failed to install NuGet provider: $($_.Exception.Message)" -LogLevel "ERROR"
+                                                exit 1
+                                        }
+                                }
+
+                                Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+
+                                # Check if AWS.Tools.S3 module is installed
+                                if (-not (Get-Module -ListAvailable -Name AWS.Tools.S3)) {
+                                        Write-Log -Message "AWS.Tools.S3 module is not installed. Installing..."
+                                        try {
+                                                Install-Module -Name AWS.Tools.S3 -Force
+                                                Write-Log -Message "AWS.Tools.S3 module installed successfully"
+                                        }
+                                        catch {
+                                                Write-Log -Message "Failed to install AWS.Tools.S3 module: $($_.Exception.Message)" -LogLevel "ERROR"
+                                                exit 1
+                                        }
+                                }
+
+                                try {
+                                        Import-Module AWS.Tools.S3
+                                        Write-Log -Message "AWS.Tools.S3 module imported successfully"
+                                }
+                                catch {
+                                        Write-Log -Message "Failed to import AWS.Tools.S3 module: $($_.Exception.Message)" -LogLevel "ERROR"
+                                        exit 1
+                                }
+                        }
+
+                        Function Get-CheckStatus {
+                          [CmdletBinding()]
+                          param (
+                            [String]$CheckType
+                          )
+
+                          try {
+                            $DiagnosticsOutput = Invoke-Expression "& '$Env:ProgramFiles\Amazon\SSM\ssm-cli.exe' get-diagnostics | ConvertFrom-Json"
+                            $Checks = $DiagnosticsOutput.DiagnosticsOutput
+
+                            foreach ($check in $Checks) {
+                              # Code to process each item
+                              if ($check.Check -eq $CheckType -and $check.Status -eq "Success") {
+                                return "Pass"
+                              }
+                              elseif ($check.Check -eq $CheckType -and $check.Status -ne "Success") {
+                                Write-Log -Message "[FAILED]: $check.Note"
+                                return "Failed"
+                              }
+                            }
+                          }
+                          catch {
+                            Write-Log -Message "Error running ssm-cli get-diagnostics: $($_.Exception.Message)" -LogLevel "ERROR"
+                            return "Failed"
+                          }
+                        }
+
+
+                        $FileNamePrefix = "UserdataSSMAgentInstallation_"
+
+                        $TimeStamp = Get-Date -Format "yyyy-MM-dd-hh-mm-ss"
+
+                        $SourceDirectory = $env:TEMP + "\ssm"
+
+                        $LogsDirectory = $SourceDirectory + "\log"
+                        #Create logs directory if it does not exist
+                        if (-not (Test-Path $LogsDirectory)) {
+                                Write-Log -Message "Creating logs directory - $LogsDirectory"
+                                New-item -Path $LogsDirectory -ItemType Directory | Out-Null
+                        }
+                        else {
+                                Write-Log -Message "Logs directory exists - $LogsDirectory"
+                        }
+                        $LogsDestination = $LogsDirectory + "\" + $FileNamePrefix + $TimeStamp + ".log"
+                        Write-Log -Message "Logs available at $LogsDestination"
+                        Write-Log -Message "SSM Agent Installation Userdata Script execution started.." 6>> $LogsDestination
+
+                        $ServiceAvailability = Get-ServiceAvailability 6>> $LogsDestination
+
+                        if ($ServiceAvailability -ne 1) {
+                                Install-SsmAgent -ParentDirectory $SourceDirectory 6>> $LogsDestination
+                        }
+
+                        $EndpointCheck = Get-CheckStatus -CheckType "Connectivity to ssm endpoint" 6>> $LogsDestination
+                        $AgentCheck = Get-CheckStatus -CheckType "Agent service" 6>> $LogsDestination
+                        $Ec2metadataCheck = Get-CheckStatus -CheckType "EC2 IMDS" 6>> $LogsDestination
+
+                        If ($EndpointCheck -eq "Pass" -And $AgentCheck -eq "Pass" -And $Ec2metadataCheck -eq "Pass") {
+                          Write-Log -Message "[SUCCESS] ssm-cli showed agent is running and connectivity to ssm endpoint passed" 6>> $LogsDestination
+                        }
+
+                        $result = Test-AWSPowerShellWriteS3ObjectCommand 6>> $LogsDestination
+                        if (-not $result) {
+                                Install-AWSPowerShellS3Module 6>> $LogsDestination
+                        }
+                        Write-S3Object -BucketName ^S3_BUCKET^ -Key "^ORCHESTRATOR_AUTOMATION_ID^/userdataexecutionlogs/^ACCOUNT_ID^/^REGION^/^INSTANCE_ID^/^AUTOMATION_ID^/logs.txt" -File $LogsDestination -Region ^REGION^
+                        </powershell>
+                            '''
+                            original_script = win_base64_script if os_platform.lower() == 'windows' else lin_base64_script
+
+                            modified_script = update_userdata_script(original_script, s3_bucket, region, automation_id, instance, os_platform)
+                            try:
+                                ec2_client = boto3.client('ec2')  # Change region as needed
+
+                                # Modify the user data
+                                ec2_client.modify_instance_attribute(
+                                    InstanceId=instance,
+                                    UserData={
+                                        'Value': modified_script
+                                    }
+                                )
+
+                                print("Successfully updated user data.")
+
+                            except Exception as e:
+                                print(f"Caught error: {str(e)}")
+
+                            return {'InstallAgentScript': modified_script}
+                      Runtime: python3.11
+                      InputPayload:
+                        instance: '{{ InstanceId }}'
+                        s3bucket: '{{ UploadLogsToS3Bucket }}'
+                        platform: '{{getInstanceProperties.instance_platform}}'
+                        orchestrator_id: '{{ OrchestratorAutomationID }}'
+                      Handler: script_handler
+                  - name: AttachTemporaryInstanceProfile
+                    action: aws:executeAutomation
+                    nextStep: StartInstance
+                    isEnd: false
+                    onFailure: Abort
+                    inputs:
+                      RuntimeParameters:
+                        AutomationAssumeRole: '{{ AutomationAssumeRole }}'
+                        RoleName: '{{TemporaryInstanceProfileToUse}}'
+                        InstanceId: '{{ InstanceId }}'
+                        ForceReplace: true
+                      DocumentName: AWS-AttachIAMToInstance
+                  - description: Start Instance after adding new userdata.
+                    name: StartInstance
+                    action: aws:changeInstanceState
+                    maxAttempts: 1
+                    timeoutSeconds: 900
+                    nextStep: Sleep
+                    isCritical: true
+                    isEnd: false
+                    onFailure: step:HandleStartInstanceError
+                    inputs:
+                      DesiredState: running
+                      InstanceIds:
+                        - '{{ InstanceId }}'
+                  - name: Sleep
+                    action: aws:sleep
+                    nextStep: stopInstanceToRestoreUserdata
+                    isEnd: false
+                    inputs:
+                      Duration: PT3M
+                  - description: Stops the provided instance.
+                    name: stopInstanceToRestoreUserdata
+                    action: aws:changeInstanceState
+                    maxAttempts: 1
+                    timeoutSeconds: 900
+                    nextStep: RestoreUserData
+                    isCritical: false
+                    isEnd: false
+                    onFailure: step:HandleStopInstanceError
+                    inputs:
+                      Force: true
+                      DesiredState: stopped
+                      InstanceIds:
+                        - '{{ InstanceId }}'
+                      CheckStateOnly: false
+                  - description: This steps restores the original userdata script of the instance.
+                    name: RestoreUserData
+                    action: aws:executeAwsApi
+                    nextStep: BranchIfPermissionstoRemove
+                    isEnd: false
+                    onFailure: Abort
+                    inputs:
+                      InstanceId: '{{ InstanceId }}'
+                      UserData:
+                        Value: '{{ getInstanceProperties.OriginalUserData }}'
+                      Service: ec2
+                      Api: ModifyInstanceAttribute
+                  - name: BranchIfPermissionstoRemove
+                    action: aws:branch
+                    inputs:
+                      Choices:
+                        - NextStep: AddOriginalInstanceProfile
+                          Not:
+                            Variable: '{{ getInstanceProperties.InstanceProfileName }}'
+                            StringEquals: NoRoleFound
+                      Default: DetachTemporaryRole
+                  - name: DetachTemporaryRole
+                    action: aws:executeScript
+                    nextStep: restoreInstanceInitialState
+                    isEnd: false
+                    inputs:
+                      Script: |
+                        import boto3
+                        import json
+
+                        def lambda_handler(event, context):
+                            try:
+                                instance_id = event['Instance']
+                                iam = boto3.client('iam')
+                                ec2 = boto3.client('ec2')
+
+                                response = ec2.describe_iam_instance_profile_associations(
+                                    Filters=[
+                                        {
+                                            'Name': 'instance-id',
+                                            'Values': [instance_id]
+                                        }
+                                    ]
+                                )
+
+                                # Check if there are any associations
+                                if response['IamInstanceProfileAssociations']:
+                                    for association in response['IamInstanceProfileAssociations']:
+                                        # Check if the profile name matches
+                                        if 'SSMAgentInstall-TemporaryInstanceProfile' in association['IamInstanceProfile']['Arn']:
+                                            # Get the association ID
+                                            association_id = association['AssociationId']
+
+                                            # Disassociate the profile
+                                            ec2.disassociate_iam_instance_profile(
+                                                AssociationId=association_id
+                                            )
+                                            return {
+                                                'output': f'Successfully detached instance profile from instance {instance_id}'
+                                            }
+
+                                return {
+                                    'output': f'No matching instance profile found for instance {instance_id}'
+                                }
+
+                            except Exception as e:
+                                return {
+                                    'output': f'Error: {str(e)}'
+                                }
+                      Runtime: python3.11
+                      InputPayload:
+                        Instance: '{{ InstanceId }}'
+                      Handler: lambda_handler
+                    outputs:
+                      - Type: String
+                        Name: output
+                        Selector: $.Payload.output
+                  - name: AddOriginalInstanceProfile
+                    action: aws:executeAutomation
+                    nextStep: restoreInstanceInitialState
+                    isCritical: false
+                    isEnd: false
+                    onFailure: Continue
+                    inputs:
+                      RuntimeParameters:
+                        AutomationAssumeRole: '{{ AutomationAssumeRole }}'
+                        RoleName: '{{getInstanceProperties.InstanceProfileName}}'
+                        InstanceId: '{{ InstanceId }}'
+                        ForceReplace: true
+                      DocumentName: AWS-AttachIAMToInstance
+                  - name: restoreInstanceInitialState
+                    action: aws:changeInstanceState
+                    maxAttempts: 2
+                    nextStep: FinalOutput
+                    isCritical: true
+                    isEnd: false
+                    onFailure: step:HandleRestoreInstanceStateError
+                    inputs:
+                      DesiredState: '{{ getInstanceProperties.state }}'
+                      InstanceIds:
+                        - '{{ InstanceId }}'
+                  - name: HandleStartInstanceError
+                    action: aws:executeScript
+                    nextStep: FinalOutput
+                    isEnd: false
+                    inputs:
+                      Script: |-
+                        def script_handler(events, context):
+                          original_state = events['OriginalState']
+                          message = f"[ERROR]: Unable to start the instance. Original State was {original_state}."
+                          return {'message': message}
+                      Runtime: python3.11
+                      InputPayload:
+                        OriginalState: '{{ getInstanceProperties.state }}'
+                      Handler: script_handler
+                    outputs:
+                      - Type: String
+                        Name: message
+                        Selector: $.Payload.message
+                  - name: HandleRestoreInstanceStateError
+                    action: aws:executeScript
+                    nextStep: FinalOutput
+                    isEnd: false
+                    inputs:
+                      Script: |-
+                        def script_handler(events, context):
+                          original_state = events['OriginalState']
+                          message = f"[ERROR]: Unable to restore the instance. Original State was {original_state}."
+                          return {'message': message}
+                      Runtime: python3.11
+                      InputPayload:
+                        OriginalState: '{{ getInstanceProperties.state }}'
+                      Handler: script_handler
+                    outputs:
+                      - Type: String
+                        Name: message
+                        Selector: $.Payload.message
+                  - name: HandleStopInstanceError
+                    action: aws:executeScript
+                    nextStep: FinalOutput
+                    isEnd: false
+                    inputs:
+                      Script: |-
+                        def script_handler(events, context):
+                          original_state = events['OriginalState']
+                          message = f"[ERROR]: Unable to stop the instance. Original State was {original_state}."
+                          return {'message': message}
+                      Runtime: python3.11
+                      InputPayload:
+                        OriginalState: '{{ getInstanceProperties.state }}'
+                      Handler: script_handler
+                    outputs:
+                      - Type: String
+                        Name: message
+                        Selector: $.Payload.message
+                  - name: FinalOutput
+                    action: aws:executeScript
+                    maxAttempts: 2
+                    isCritical: false
+                    isEnd: true
+                    inputs:
+                      Script: |-
+                        import boto3
+                        from botocore.exceptions import ClientError
+
+                        def script_handler(events, context):
+                            instance = events["instance"]
+                            orchestrator_automation_id = events["orchestrator_id"]
+                            region = context.get("global:REGION")
+                            account_id = context.get("global:ACCOUNT_ID")
+                            s3_bucket = events["s3bucket"]
+                            os_platform = events["platform"]
+                            already_ssm_managed = events["isSSMManaged"]
+                            attach_iam_status = events["iamAttachStatus"]
+                            restore_iam_status = events["iamRestoreStatus"]
+                            automation_id = context.get("automation:EXECUTION_ID")
+                            prerequisite_error = events["prerequisiteError"]
+                            stop_instance_error = events["stopinstanceError"]
+                            start_instance_error = events["startinstanceError"]
+                            restore_instance_error = events["restoreinstanceStateError"]
+                            text = ""
+
+                            if 'HandlePrerequisiteEvaluationError.message' not in prerequisite_error:
+                                text += prerequisite_error
+                            elif 'HandleStopInstanceError.message' not in stop_instance_error:
+                                text += stop_instance_error
+                            elif 'HandleStartInstanceError.message' not in start_instance_error:
+                                text += stop_instance_error
+                            elif 'HandleRestoreInstanceStateError.message' not in restore_instance_error:
+                                text += stop_instance_error
+                            elif already_ssm_managed == 'true':
+                                text += f"Instance is already SSM Managed."
+                            elif attach_iam_status == 'Failed':
+                                text += f"Automation failed when attaching temporary IAM role to the instance."
+                            elif restore_iam_status == 'Failed':
+                                text += f"Automation failed when attaching the original IAM role to the instance. "
+                            else:
+                                try:
+                                    s3 = boto3.client('s3')
+
+                                    bucket_name = s3_bucket
+                                    object_key = f"{orchestrator_automation_id}/userdataexecutionlogs/{account_id}/{region}/{instance}/{automation_id}/logs.txt"
+
+                                    obj = s3.get_object(Bucket=bucket_name, Key=object_key)
+
+                                    # Read the contents of the object as a string
+                                    if os_platform.lower() == 'windows':
+                                        file_content = obj['Body'].read().decode('utf-16')
+                                    else:
+                                        file_content = obj['Body'].read().decode('utf-8')
+                                    text += file_content
+
+                                except ClientError as e:
+                                    error_code = e.response['Error']['Code']
+                                    error_message = e.response['Error']['Message']
+                                    if error_code == 'NoSuchKey':
+                                        if os_platform.lower() == 'windows':
+                                          text += f"Couldn't find userdata logs in the S3 bucket. It is possible the installation was complete but log upload failed from the instance. Confirm if the instance is now managed from Fleet Manager console. You can check the Execution Log file under C:\Windows\TEMP\ssm\log"
+                                        else:
+                                          text += f"Couldn't find userdata logs in the S3 bucket. It is possible the installation was complete but log upload failed from the instance. Confirm if the instance is now managed from Fleet Manager console. You can check the Execution Log file under /var/log/UserdataSSMAgentInstallation/"
+                                    else:
+                                        text += f"Error occurred while accessing S3 bucket: {error_code} - {error_message}"
+                            return {'output': text}
+                      Runtime: python3.11
+                      InputPayload:
+                        prerequisiteError: '{{ HandlePrerequisiteEvaluationError.message}}'
+                        restoreinstanceStateError: '{{ HandleRestoreInstanceStateError.message}}'
+                        instance: '{{ InstanceId }}'
+                        s3bucket: '{{ UploadLogsToS3Bucket }}'
+                        startinstanceError: '{{ HandleStartInstanceError.message}}'
+                        isSSMManaged: '{{ getInstanceProperties.SSMManaged }}'
+                        iamRestoreStatus: '{{ AddOriginalInstanceProfile.Status}}'
+                        stopinstanceError: '{{ HandleStopInstanceError.message}}'
+                        iamAttachStatus: '{{ AttachTemporaryInstanceProfile.Status}}'
+                        platform: '{{getInstanceProperties.instance_platform}}'
+                        orchestrator_id: '{{ OrchestratorAutomationID }}'
+                      Handler: script_handler
+                    outputs:
+                      - Type: String
+                        Name: output
+                        Selector: $.Payload.output
+                outputs:
+                  - FinalOutput.output
+
+  #-------------------------------------------------
+  # Automation Administration role for multi-account/Region Automation capabilities
+  #-------------------------------------------------
+  AutomationAdministrationRolePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Action:
+          - sts:AssumeRole
+          - iam:PassRole
+          Resource:
+            - !Sub arn:${AWS::Partition}:iam::*:role/SSMAgentInstall-MAMR-AutomationExecutionRole
+            - !Sub arn:${AWS::Partition}:iam::*:role/SSMAgentInstall-MAMR-AutomationAdministrationRole
+        - Effect: Allow
+          Action:
+          - organizations:ListAccountsForParent
+          - organizations:ListRoots
+          Resource:
+          - "*"
+        - Effect: Allow
+          Action:
+          - s3:GetObject
+          - s3:PutObject
+          Resource:
+            - !Sub arn:${AWS::Partition}:s3:::${S3LogsBucket}/*
+      PolicyName: SSMAgentInstall-MAMR-AutomationAdminstrationPolicy
+      Roles:
+        - !Ref AutomationAdministrationServiceRole
+  AutomationAdministrationServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: SSMAgentInstall-MAMR-AutomationAdministrationRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: ssm.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonSSMAutomationRole
+      Path: "/"
+Outputs:
+  AdministrationRoleArn:
+    Description: AdministrationRoleArn
+    Value: !GetAtt AutomationAdministrationServiceRole.Arn
+  S3BucketName:
+    Description: S3BucketName
+    Value: !Ref S3LogsBucket
+  OrchestratorRunbook:
+    Description: SSMAutomationName
+    Value: !Ref SSMAutomationRunbookOrchestrator

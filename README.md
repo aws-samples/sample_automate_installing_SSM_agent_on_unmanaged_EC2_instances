@@ -1,11 +1,14 @@
-## My Project
+# Automate installing SSM agent on unmanaged EC2 instances in an AWS Organization
 
-TODO: Fill this README out!
+This repo hosts templates written for the AWS Blog Post "[Automate installing SSM agent on unmanaged EC2 instances in an AWS Organization](https://aws.amazon.com/blogs/mt/)" published on the [AWS Cloud Operations & Migrations](https://aws.amazon.com/blogs/mt/) blog channel.
 
-Be sure to:
+For details on how to use the corresponding CloudFormation templates, refer to the blog post.
 
-* Change the title in this README
-* Edit your repository description on GitHub
+CloudFormation Templates:
+
+* [SSMAgentMultiAccountInstallation.yaml](/Templates/CloudFormation/SSMAgentMultiAccountInstallation.yaml)
+
+![Architectural Diagram](/Images/ArchitecturalDiagram.png)
 
 ## Security
 
@@ -14,4 +17,3 @@ See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more inform
 ## License
 
 This library is licensed under the MIT-0 License. See the LICENSE file.
-
