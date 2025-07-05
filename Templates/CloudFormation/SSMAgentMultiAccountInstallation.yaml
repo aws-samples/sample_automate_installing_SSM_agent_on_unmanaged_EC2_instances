@@ -4,13 +4,15 @@ Parameters:
   DeploymentTargetsOUs:
     Description: Specify the one or more Organizational Unit IDs (OU IDs)where target instances are located. (e.g. ou-srdk-01234567,ou-srdk-98765432)
     Type: CommaDelimitedList
+    AllowedPattern : '^(ou-[a-z0-9]{4,32}-[a-z0-9]{8,32}|r-[a-z0-9]{4,32})(,(ou-[a-z0-9]{4,32}-[a-z0-9]{8,32}|r-[a-z0-9]{4,32}))*$'
   OrganizationId:
-    Description: (Optional) For Organizational ID. (e.g., o-kiw5ig7em1)
+    Description: (Optional) For Organizational ID. (e.g. o-kiw5ig7em1)
     Type: String
     AllowedPattern: '^o-[a-z0-9]{10,32}$'
   TargetRegions:
     Type: CommaDelimitedList
     Description: "One or more regions to deploy the required resources. Input the regions as List where instances are running. (e.g. us-east-1, us-east-2)"
+    AllowedPattern: ^(us|eu|ap|sa|ca|me|il|mx|af)-(east|west|north|south|southeast|northeast|central)-[1-7]$|^us-gov-(east|west)-1$
 Resources:
   #-------------------------------------------------
   # Main Automation Orchestrator runbook
@@ -26,8 +28,10 @@ Resources:
         schemaVersion: '0.3'
         description: |
           This automation runbook serves as the primary orchestrator for deploying SSM Agent across multiple AWS accounts. It initiates the deployment process by executing the SSMAgentInstall-Primary runbook in a multi-account automation mode, coordinating the installation workflow across all specified target accounts.
+          #### Supported Operated Systems:
+          This solution was tested on the following OS : **Windows Server 2016-2025, Amazon Linux 2/2023, RHEL/CentOS 7.x-10.x, Ubuntu 18.04-24.04, SUSE Linux Enterprise 15.x**
 
-          There are two ways to provide the targets for the automation -
+          #### There are two ways to provide the targets for the automation -
             - Target the Instances using Tags. For this option, provide values for these input parameters - TargetTagKey,TargetTagValue,TargetAccounts,TargetRegions
             - Target the unmanaged Instances from the diagnose and remediate results. For this option, provide the value for the input parameter - DiagnoseAndRemediateS3Results
         assumeRole: '{{ AutomationAssumeRole }}'
@@ -47,7 +51,7 @@ Resources:
             allowedPattern: "^$|^InstanceIds$|^tag:.+$"
           TargetTagValue:
             default: ''
-            description: (Optional) Provide the Target's tag value to target the automation. to target all unmanaged instances use *
+            description: (Optional) Provide the Target's tag value to target the automation. To target all unmanaged instances use *
             type: String
             maxChars: 50
           TargetAccounts:
@@ -127,13 +131,20 @@ Resources:
                 from typing import List, Optional
 
                 try:
-                    boto_modules = [m for m in sys.modules.keys() if m.startswith('boto')]
-                    for m in boto_modules:
-                        del(sys.modules[m])
-
-                    packages = ['boto3', 'pandas']
+                    packages = ['numpy==2.2.5', 'pytz', 'python-dateutil', 'pandas']
                     for package in packages:
-                        subprocess.check_call([sys.executable, "-m", "pip", "install", package, "-t", "/tmp/"])
+                        subprocess.check_call([
+                            sys.executable,
+                            "-m",
+                            "pip",
+                            "install",
+                            "--no-cache-dir",
+                            "--no-deps",
+                            "--ignore-installed",
+                            package,
+                            "-t",
+                            "/tmp/"
+                        ])
 
                     sys.path.insert(0, '/tmp/')
                     import pandas as pd
@@ -771,13 +782,20 @@ Resources:
                 sys.tracebacklimit = 0
 
                 try:
-                    boto_modules = [m for m in sys.modules.keys() if m.startswith('boto')]
-                    for m in boto_modules:
-                        del(sys.modules[m])
-
-                    packages = ['boto3', 'pandas']
+                    packages = ['numpy==2.2.5', 'pytz', 'python-dateutil', 'pandas']
                     for package in packages:
-                        subprocess.check_call([sys.executable, "-m", "pip", "install", package, "-t", "/tmp/"])
+                        subprocess.check_call([
+                            sys.executable,
+                            "-m",
+                            "pip",
+                            "install",
+                            "--no-cache-dir",
+                            "--no-deps",
+                            "--ignore-installed",
+                            package,
+                            "-t",
+                            "/tmp/"
+                        ])
 
                     sys.path.insert(0, '/tmp/')
                     import pandas as pd
@@ -1349,7 +1367,7 @@ Resources:
             OrganizationalUnitIds: !Ref DeploymentTargetsOUs
       TemplateBody: |
         AWSTemplateFormatVersion: 2010-09-09
-        Description: 'CloudFormation template to deploy SSMAgentInstall-Secondary runbook'
+        Description: 'SSMAgentInstall-Secondary runbook deployment'
         Resources:
           SSMAutomationRunbookSecondary:
             Type: AWS::SSM::Document
@@ -1361,6 +1379,8 @@ Resources:
                 schemaVersion: '0.3'
                 description: |-
                   **This automation runbook will install SSM Agent on EC2 instance using userdata script.**
+                  #### Supported Operated Systems:
+                  This solution was tested on the following OS : **Windows Server 2016-2025, Amazon Linux 2/2023, RHEL/CentOS 7.x-10.x, Ubuntu 18.04-24.04, SUSE Linux Enterprise 15.x**
                   ### Prerequisites :
                   1. **S3 Connectivity**: The target EC2 instance must have connectivity to S3 in order to download the SSM Agent package and upload execution logs.
                   2. **Required Dependencies**: For Linux,unzip,curl,awscli is required to download the ssm agent software. If these are not present, it will be installed.
@@ -1400,7 +1420,6 @@ Resources:
                             user_data = ''
                             instance_state = ''
 
-                            # Check if the instance is already managed by SSM
                             try:
                                 response = ssm.describe_instance_information(
                                     InstanceInformationFilterList=[
@@ -1422,57 +1441,52 @@ Resources:
                                 response = ec2.describe_instances(InstanceIds=[instance_id])
                                 instance_data = response['Reservations'][0]['Instances'][0]
                                 instance_platform = instance_data.get('Platform', '')
+                                instance_state = instance_data['State']['Name']
+                                validation_errors = []
 
-                                # Check if the instance is a spot or asg instance
                                 instance_lifecycle = instance_data.get('InstanceLifecycle', '')
                                 if instance_lifecycle == 'spot':
-                                    error_message = f"The instance {instance_id} is a spot instance. Exiting..."
-                                    return {'OriginalUserData': '', 'state': '','SSMManaged':'','instance_profile': '', 'platform': '', 'error': error_message}
-                                instances = autoscaling.describe_auto_scaling_instances(InstanceIds=[instance_id])[
-                                    "AutoScalingInstances"
-                                ]
+                                    validation_errors.append(f"Instance {instance_id} is a spot instance")
+
+                                instances = autoscaling.describe_auto_scaling_instances(InstanceIds=[instance_id])["AutoScalingInstances"]
                                 if instances and instances[0]["LifecycleState"] not in ["Standby"]:
-                                    error_message = f"The instance {instance_id} is part of an Auto Scaling group. Exiting..."
-                                    return {'OriginalUserData': '', 'state': '','SSMManaged':'','instance_profile': '', 'platform': '', 'error': error_message}
+                                    validation_errors.append(f"Instance {instance_id} is part of an Auto Scaling group")
 
-                                instance_state = instance_data['State']['Name']
                                 if instance_state not in ['running']:
-                                    error_message = f"The instance {instance_id} is in an invalid state ({instance_state}).Required state is running. Exiting..."
-                                    return {'OriginalUserData': '', 'state': '','SSMManaged':'','instance_profile': '', 'platform': '', 'error': error_message}
+                                    validation_errors.append(f"Instance {instance_id} is in state {instance_state}, required: running")
 
-                                root_device_type = instance_data['RootDeviceType']
-                                if root_device_type != 'ebs':
-                                    error_message = f"The instance {instance_id} does not have an EBS root device. Exiting..."
-                                    return {'OriginalUserData': '', 'state': '','SSMManaged':'','instance_profile': '', 'platform': '', 'error': error_message}
+                                if instance_data['RootDeviceType'] != 'ebs':
+                                    validation_errors.append(f"Instance {instance_id} does not have an EBS root device")
 
-                                instance_shutdown_attribute = ec2.describe_instance_attribute(
+                                shutdown_attr = ec2.describe_instance_attribute(
                                     InstanceId=instance_id,
                                     Attribute='instanceInitiatedShutdownBehavior'
                                 )
-                                shutdown_behavior = instance_shutdown_attribute['InstanceInitiatedShutdownBehavior'].get('Value', None)
+                                shutdown_behavior = shutdown_attr['InstanceInitiatedShutdownBehavior'].get('Value', None)
                                 if shutdown_behavior != 'stop':
-                                    error_message = f"The instance {instance_id} has an invalid shutdown behavior ({shutdown_behavior}) . Exiting..."
-                                    return {'OriginalUserData': '', 'state': '','SSMManaged':'','instance_profile': '', 'platform': '', 'error': error_message}
+                                    validation_errors.append(f"Instance {instance_id} has invalid shutdown behavior: {shutdown_behavior}")
 
-                                print(f"Instance {instance_id} passed all checks.")
+                                if validation_errors:
+                                    return {'OriginalUserData': '', 'state': '', 'SSMManaged': '', 'instance_profile': '',
+                                            'platform': '', 'error': '; '.join(validation_errors)}
 
-                                if 'IamInstanceProfile' in response['Reservations'][0]['Instances'][0]:
-                                    instance_profile_name = response['Reservations'][0]['Instances'][0]['IamInstanceProfile']['Arn'].split('instance-profile/')[1]
+                                if 'IamInstanceProfile' in instance_data:
+                                    instance_profile_name = instance_data['IamInstanceProfile']['Arn'].split('instance-profile/')[1]
                                 else:
                                     instance_profile_name = 'NoRoleFound'
 
-                                # Get current Userdata
                                 instance_userdata = ec2.describe_instance_attribute(
                                     InstanceId=instance_id,
                                     Attribute='userData'
                                 )
                                 user_data = instance_userdata['UserData'].get('Value', '')
 
-                                return {'OriginalUserData': user_data, 'state': instance_state,'SSMManaged':'false','instance_profile': instance_profile_name, 'platform': instance_platform, 'error': 'None'}
+                                return {'OriginalUserData': user_data, 'state': instance_state, 'SSMManaged': 'false',
+                                        'instance_profile': instance_profile_name, 'platform': instance_platform, 'error': 'None'}
 
                             except ClientError as e:
-                                error_message = f"Error checking instance properties: {e}"
-                                return {'OriginalUserData': '', 'state': '','SSMManaged':'','instance_profile': '', 'platform': '', 'error': error_message}
+                                return {'OriginalUserData': '', 'state': '', 'SSMManaged': '', 'instance_profile': '',
+                                        'platform': '', 'error': f"Error: {str(e)}"}
                       Runtime: python3.11
                       InputPayload:
                         InstanceId: '{{ InstanceId }}'
@@ -1591,7 +1605,7 @@ Resources:
                                     updated_script = base64.b64encode(script.encode('utf-8')).decode('utf-8')
                                 return updated_script
 
-                            lin_base64_script = "Q29udGVudC1UeXBlOiBtdWx0aXBhcnQvbWl4ZWQ7IGJvdW5kYXJ5PSIvLyIKTUlNRS1WZXJzaW9uOiAxLjAKCi0tLy8KQ29udGVudC1UeXBlOiB0ZXh0L2Nsb3VkLWNvbmZpZzsgY2hhcnNldD0idXMtYXNjaWkiCk1JTUUtVmVyc2lvbjogMS4wCkNvbnRlbnQtVHJhbnNmZXItRW5jb2Rpbmc6IDdiaXQKQ29udGVudC1EaXNwb3NpdGlvbjogYXR0YWNobWVudDsKIGZpbGVuYW1lPSJjbG91ZC1jb25maWcudHh0IgoKI2Nsb3VkLWNvbmZpZwpjbG91ZF9maW5hbF9tb2R1bGVzOgotIFtzY3JpcHRzLXVzZXIsIGFsd2F5c10KLS0vLwpDb250ZW50LVR5cGU6IHRleHQveC1zaGVsbHNjcmlwdDsgY2hhcnNldD0idXMtYXNjaWkiCk1JTUUtVmVyc2lvbjogMS4wCkNvbnRlbnQtVHJhbnNmZXItRW5jb2Rpbmc6IDdiaXQKQ29udGVudC1EaXNwb3NpdGlvbjogYXR0YWNobWVudDsgZmlsZW5hbWU9InVzZXJkYXRhLnR4dCIKCiMhL2Jpbi9iYXNoCnNldCAtZQoKcGFja2FnZV9leGlzdHMoKSB7CiAgICAkKHdoaWNoICIkMSIgPiAvZGV2L251bGwgMj4mMSApCiAgICByZXR1cm4gJD8KfQoKIyBGdW5jdGlvbiB0byBpbnN0YWxsIEFXUyBDTEkKaW5zdGFsbF9hd3NfY2xpKCkgewogIGlmIHBhY2thZ2VfZXhpc3RzIGF3czsgdGhlbgogICAgZWNobyAiQVdTIENMSSBpcyBhbHJlYWR5IGluc3RhbGxlZC4iID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgZWxzZQogICAgZWNobyAiSW5zdGFsbGluZyBBV1MgQ0xJLi4uIgogICAgY3VybCAtbyAiYXdzY2xpdjIuemlwIiAiaHR0cHM6Ly9hd3NjbGkuYW1hem9uYXdzLmNvbS9hd3NjbGktZXhlLWxpbnV4LXg4Nl82NC56aXAiID4gL2Rldi9udWxsIDI+JjEKICAgIHVuemlwIGF3c2NsaXYyLnppcCA+IC9kZXYvbnVsbCAyPiYxCiAgICBzdWRvIC4vYXdzL2luc3RhbGwgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEggPiAvZGV2L251bGwgMj4mMQogICAgZWNobyAiIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogIGZpCn0KCmluc3RhbGxfZGVwZW5kZW5jaWVzKCkgewogIGxvY2FsIGRlcGVuZGVuY2llcz0oIiRAIikKICBsb2NhbCBtaXNzaW5nX2RlcHM9KCkKCiAgZm9yIGRlcCBpbiAiJHtkZXBlbmRlbmNpZXNbQF19IjsgZG8KICAgIGlmICEgcGFja2FnZV9leGlzdHMgIiRkZXAiOyB0aGVuCiAgICAgIG1pc3NpbmdfZGVwcys9KCIkZGVwIikKICAgIGZpCiAgZG9uZQoKICBpZiBbICR7I21pc3NpbmdfZGVwc1tAXX0gLWVxIDAgXTsgdGhlbgogICAgZWNobyAiQWxsIGRlcGVuZGVuY2llcyByZXF1aXJlZCBhcmUgYWxyZWFkeSBpbnN0YWxsZWQuIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgcmV0dXJuCiAgZmkKCiAgaWYgcGFja2FnZV9leGlzdHMgeXVtOyB0aGVuCiAgICBlY2hvICJJbnN0YWxsaW5nIG1pc3NpbmcgZGVwZW5kZW5jaWVzIHZpYSB5dW0gY29tbWFuZDogJHttaXNzaW5nX2RlcHNbKl19IgogICAgeXVtIGluc3RhbGwgLXkgIiR7bWlzc2luZ19kZXBzW0BdfSIKICAgIGlmIFsgJD8gLW5lIDAgXTsgdGhlbgogICAgICAgIGVjaG8gIkVycm9yOiBGYWlsZWQgdG8gaW5zdGFsbCBkZXBlbmRlbmNpZXMuIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgZmkKICAgIHl1bSBjbGVhbiBhbGwgPiAvZGV2L251bGwgMj4mMQogIGVsaWYgcGFja2FnZV9leGlzdHMgenlwcGVyOyB0aGVuCiAgICBlY2hvICJJbnN0YWxsaW5nIG1pc3NpbmcgZGVwZW5kZW5jaWVzIHZpYSB6eXBwZXIgY29tbWFuZDogJHttaXNzaW5nX2RlcHNbKl19IgogICAgenlwcGVyIC1uIGluc3RhbGwgIiR7bWlzc2luZ19kZXBzW0BdfSIKICAgIGlmIFsgJD8gLW5lIDAgXTsgdGhlbgogICAgICAgIGVjaG8gIkVycm9yOiBGYWlsZWQgdG8gaW5zdGFsbCBkZXBlbmRlbmNpZXMgdXNpbmcgenlwcGVyLiIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgIGZpCiAgZWxzZQogICAgZWNobyAiSW5zdGFsbGluZyBtaXNzaW5nIGRlcGVuZGVuY2llcyB2aWEgYXB0LWdldCBjb21tYW5kOiAke21pc3NpbmdfZGVwc1sqXX0iCiAgICBhcHQtZ2V0IHVwZGF0ZSAmJiBhcHQtZ2V0IGluc3RhbGwgLXkgIiR7bWlzc2luZ19kZXBzW0BdfSIKICAgIGlmIFsgJD8gLW5lIDAgXTsgdGhlbgogICAgICAgIGVjaG8gIkVycm9yOiBGYWlsZWQgdG8gaW5zdGFsbCBkZXBlbmRlbmNpZXMgdXNpbmcgQXB0LiIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgIGZpCiAgZmkKfQoKCmdldF9hcmNoKCkgewogICAgbG9jYWwgYXJjaF91bmFtZQogICAgYXJjaF91bmFtZT0kKHVuYW1lIC1tKQogICAgY2FzZSAkYXJjaF91bmFtZSBpbgogICAgIng4Nl82NCIpCiAgICAgICAgYXJjaD0iYW1kNjQiCiAgICAgICAgcmV0dXJuIDAKICAgICAgICA7OwogICAgImFhcmNoNjQiKQogICAgICAgIGFyY2g9ImFybTY0IgogICAgICAgIHJldHVybiAwCiAgICAgICAgOzsKICAgICopCiAgICAgICAgZWNobyAiVW5rbm93biBBcmNoaXRlY2h0dXJlIGZvdW5kOiAkYXJjaF91bmFtZSIKICAgICAgICBleGl0IDEKICAgICAgICA7OwogICAgZXNhYwp9CgpnZXRfcGFja2FnZV9tYW5hZ2VyKCkgewogICAgaWYgY29tbWFuZCAtdiBzbmFwOyB0aGVuCiAgICAgICAgcGFja2FnZV9tYW5hZ2VyPSJzbmFwIgogICAgZWxpZiBjb21tYW5kIC12IGRwa2c7IHRoZW4KICAgICAgICBwYWNrYWdlX21hbmFnZXI9ImRwa2ciCiAgICBlbGlmIGNvbW1hbmQgLXYgZG5mOyB0aGVuCiAgICAgICAgcGFja2FnZV9tYW5hZ2VyPSJkbmYiCiAgICBlbGlmIGNvbW1hbmQgLXYgeXVtOyB0aGVuCiAgICAgICAgcGFja2FnZV9tYW5hZ2VyPSJ5dW0iCiAgICBlbGlmIGNvbW1hbmQgLXYgenlwcGVyOyB0aGVuCiAgICAgICAgcGFja2FnZV9tYW5hZ2VyPSJ6eXBwZXIiCiAgICBlbHNlCiAgICAgICAgZWNobyAiTm8gU3VwcG9ydGVkIFBhY2thZ2UgTWFuYWdlciBGb3VuZCIKICAgICAgICBleGl0IDEKICAgIGZpCiAgICByZXR1cm4gMAp9CgpnZXRfc2VydmljZV9tYW5hZ2VyKCkgewogICAgaWYgY29tbWFuZCAtdiBzeXN0ZW1jdGw7IHRoZW4KICAgICAgICBzZXJ2aWNlX21hbmFnZXI9InN5c3RlbWN0bCIKICAgIGVsaWYgY29tbWFuZCAtdiBpbml0Y3RsOyB0aGVuCiAgICAgICAgc2VydmljZV9tYW5hZ2VyPSJpbml0Y3RsIgogICAgZWxzZQogICAgICAgIGVjaG8gIk5vIFN1cHBvcnRlZCBTZXJ2aWNlIE1hbmFnZXIgRm91bmQiID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICAgICAgZXhpdCAxCiAgICBmaQogICAgcmV0dXJuIDAKfQoKZ2V0X3NzbV9hZ2VudF9zZXJ2aWNlKCkgewogICAgaWYgWyAiJHBhY2thZ2VfbWFuYWdlciIgPSAic25hcCIgXTsgdGhlbgogICAgICAgIHNzbV9hZ2VudF9zZXJ2aWNlPSJzbmFwLmFtYXpvbi1zc20tYWdlbnQuYW1hem9uLXNzbS1hZ2VudCIKICAgIGVsc2UKICAgICAgICBzc21fYWdlbnRfc2VydmljZT0iYW1hem9uLXNzbS1hZ2VudCIKICAgIGZpCiAgICByZXR1cm4gMAp9Cgpzc21faXNfYWxyZWFkeV9pbnN0YWxsZWQoKSB7CiAgICBpZiBbICIkcGFja2FnZV9tYW5hZ2VyIiA9ICJ5dW0iIF0gfHwgWyAiJHBhY2thZ2VfbWFuYWdlciIgPSAienlwcGVyIiBdIHx8IFsgIiRwYWNrYWdlX21hbmFnZXIiID0gImRuZiIgXTsgdGhlbgogICAgICAgIGlmIHJwbSAtcSBhbWF6b24tc3NtLWFnZW50OyB0aGVuCiAgICAgICAgICAgIGVjaG8gIlNTTSBBZ2VudCBpcyBhbHJlYWR5IGluc3RhbGxlZCIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgICAgICAgICAgcmV0dXJuIDAKICAgICAgICBmaQogICAgICAgIHJldHVybiAxCiAgICBlbGlmIFsgIiRwYWNrYWdlX21hbmFnZXIiID0gInNuYXAiIF07IHRoZW4KICAgICAgICBpZiBzbmFwIGxpc3QgYW1hem9uLXNzbS1hZ2VudDsgdGhlbgogICAgICAgICAgICBlY2hvICJTU00gQWdlbnQgaXMgYWxyZWFkeSBpbnN0YWxsZWQiID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICAgICAgICAgIHJldHVybiAwCiAgICAgICAgZmkKICAgICAgICByZXR1cm4gMQogICAgZWxpZiBbICIkcGFja2FnZV9tYW5hZ2VyIiA9ICJkcGtnIiBdOyB0aGVuCiAgICAgICAgaWYgWyAkKGRwa2ctcXVlcnkgLVcgLWY9JyR7U3RhdHVzfScgYW1hem9uLXNzbS1hZ2VudCAyPi9kZXYvbnVsbCB8IGdyZXAgLWMgIm9rIGluc3RhbGxlZCIpIC1uZSAwIF07IHRoZW4KICAgICAgICAgICAgZWNobyAiU1NNIEFnZW50IGlzIGFscmVhZHkgaW5zdGFsbGVkIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgICAgICAgICByZXR1cm4gMAoKICAgICAgICBmaQogICAgICAgIHJldHVybiAxCiAgICBlbHNlCiAgICAgICAgZWNobyAiTm8gU3VwcG9ydGVkIFBhY2thZ2UgTWFuYWdlciBGb3VuZC4gRXhpdGluZy4uIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgICAgIGV4aXQgMQogICAgZmkKfQoKc3RhcnRfc3NtX2FnZW50KCkgewogICAgaWYgWyAtbiAiJHNlcnZpY2VfbWFuYWdlciIgXSAmJiBbIC1uICIkc3NtX2FnZW50X3NlcnZpY2UiIF07IHRoZW4KICAgICAgICBzdWRvICIkc2VydmljZV9tYW5hZ2VyIiBzdGFydCAiJHNzbV9hZ2VudF9zZXJ2aWNlIgogICAgICAgIHJldHVybiAkPwogICAgZWxzZQogICAgICAgIHJldHVybiAxCiAgICBmaQp9CgppbnN0YWxsX3NzbV9hZ2VudCgpIHsKICAgIGlmIFsgIiRwYWNrYWdlX21hbmFnZXIiID0gInNuYXAiIF07IHRoZW4KICAgICAgICBzdWRvIHNuYXAgaW5zdGFsbCBhbWF6b24tc3NtLWFnZW50IC0tY2xhc3NpYyA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgICAgIHJldHVybiAwCiAgICBmaQoKICAgIGlmIFsgIiRwYWNrYWdlX21hbmFnZXIiID0gImRwa2ciIF07IHRoZW4KICAgICAgICBsb2NhbCBzc21faW5zdGFsbF91cmw9aHR0cHM6Ly9zMy5hbWF6b25hd3MuY29tL2VjMi1kb3dubG9hZHMtd2luZG93cy9TU01BZ2VudC9sYXRlc3QvZGViaWFuXyR7YXJjaH0vYW1hem9uLXNzbS1hZ2VudC5kZWIKICAgICAgICBsb2NhbCBkZWJfaW5zdGFsbGVyX2xvY2F0aW9uPS90bXAvYW1hem9uLXNzbS1hZ2VudC5kZWIKICAgICAgICBjdXJsIC0tcmV0cnkgMyAtbyAiJHtkZWJfaW5zdGFsbGVyX2xvY2F0aW9ufSIgIiR7c3NtX2luc3RhbGxfdXJsfSIKICAgICAgICAgICAgaWYgWyAhIC1mICIke2RlYl9pbnN0YWxsZXJfbG9jYXRpb259IiBdOyB0aGVuCiAgICAgICAgICAgICAgICBlY2hvICJGYWlsZWQgdG8gZG93bmxvYWQgU1NNIEFnZW50IERlYiBpbnN0YWxsZXI6ICR7c3NtX2luc3RhbGxfdXJsfSIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgICAgICAgICAgICAgIGV4aXQgMQogICAgICAgICAgICBmaQogICAgZWxzZQogICAgICAgIGxvY2FsIHNzbV9pbnN0YWxsX3VybD1odHRwczovL3MzLmFtYXpvbmF3cy5jb20vZWMyLWRvd25sb2Fkcy13aW5kb3dzL1NTTUFnZW50L2xhdGVzdC9saW51eF8ke2FyY2h9L2FtYXpvbi1zc20tYWdlbnQucnBtCiAgICAgICAgbG9jYWwgcnBtX2luc3RhbGxlcl9sb2NhdGlvbj0vdG1wL2FtYXpvbi1zc20tYWdlbnQucnBtCiAgICAgICAgY3VybCAtLXJldHJ5IDMgLW8gIiR7cnBtX2luc3RhbGxlcl9sb2NhdGlvbn0iICIke3NzbV9pbnN0YWxsX3VybH0iCiAgICAgICAgaWYgWyAhIC1mICIke3JwbV9pbnN0YWxsZXJfbG9jYXRpb259IiBdOyB0aGVuCiAgICAgICAgICAgIGVjaG8gIkZhaWxlZCB0byBkb3dubG9hZCBTU00gQWdlbnQgUlBNIGluc3RhbGxlcjogJHtzc21faW5zdGFsbF91cmx9IiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgICAgICAgICBleGl0IDEKICAgICAgICBmaQogICAgZmkKCgogICAgaWYgWyAiJHBhY2thZ2VfbWFuYWdlciIgPSAienlwcGVyIiBdOyB0aGVuCiAgICAgICAgc3VkbyB6eXBwZXIgLS1ub24taW50ZXJhY3RpdmUgLS1uby1ncGctY2hlY2tzIGluc3RhbGwgJHtycG1faW5zdGFsbGVyX2xvY2F0aW9ufQogICAgICAgIGlmIFsgJD8gLW5lIDAgXTsgdGhlbgogICAgICAgICAgICBlY2hvICJFcnJvcjogRmFpbGVkIHRvIGluc3RhbGwgcGFja2FnZSB1c2luZyB6eXBwZXIuIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgICAgICAgICBleGl0IDEKICAgICAgICBmaQogICAgZWxpZiBbICIkcGFja2FnZV9tYW5hZ2VyIiA9ICJkbmYiIF07IHRoZW4KICAgICAgICBzdWRvIGRuZiBpbnN0YWxsIC15ICR7cnBtX2luc3RhbGxlcl9sb2NhdGlvbn0KICAgICAgICBpZiBbICQ/IC1uZSAwIF07IHRoZW4KICAgICAgICAgICAgZWNobyAiRXJyb3I6IEZhaWxlZCB0byBpbnN0YWxsIHBhY2thZ2UgdXNpbmcgZG5mLiIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgICAgICAgICAgZXhpdCAxCiAgICAgICAgZmkKCiAgICBlbGlmIFsgIiRwYWNrYWdlX21hbmFnZXIiID0gInl1bSIgXTsgdGhlbgogICAgICAgIHN1ZG8geXVtIGxvY2FsaW5zdGFsbCAteSAke3JwbV9pbnN0YWxsZXJfbG9jYXRpb259CiAgICAgICAgaWYgWyAkPyAtbmUgMCBdOyB0aGVuCiAgICAgICAgICAgIGVjaG8gIkVycm9yOiBGYWlsZWQgdG8gaW5zdGFsbCBwYWNrYWdlIHVzaW5nIHl1bS4iID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICAgICAgICAgIGV4aXQgMQogICAgICAgIGZpCiAgICBlbGlmIFsgIiRwYWNrYWdlX21hbmFnZXIiID0gImRwa2ciIF07IHRoZW4KICAgICAgICBzdWRvIGRwa2cgLWkgJHtkZWJfaW5zdGFsbGVyX2xvY2F0aW9ufQogICAgICAgIGlmIFsgJD8gLW5lIDAgXTsgdGhlbgogICAgICAgICAgICBlY2hvICJFcnJvcjogRmFpbGVkIHRvIGluc3RhbGwgcGFja2FnZSB1c2luZyBkcGtnLiIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgICAgICAgICAgZXhpdCAxCiAgICAgICAgZmkKICAgIGVsc2UKICAgICAgICBlY2hvICJObyBTdXBwb3J0ZWQgUGFja2FnZSBNYW5hZ2VyIEZvdW5kIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgICAgIGV4aXQgMQogICAgZmkKICAgIHN1ZG8gc3lzdGVtY3RsIGVuYWJsZSBhbWF6b24tc3NtLWFnZW50CiAgICBlY2hvICJTdWNjZXNzZnVsbHkgSW5zdGFsbGVkIFNTTSBBZ2VudC4iID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICBycG0gLXFhIHwgZ3JlcCBhbWF6b24tc3NtLWFnZW50ICA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgcmV0dXJuIDAKfQoKIyMjIyMjIyMjIyMjIyMgU1RBUlQgIyMjIyMjIyMjIyMjIyMKZWNobyAiU1NNIEFnZW50IEluc3RhbGxhdGlvbiBVc2VyZGF0YSBTY3JpcHQgZXhlY3V0aW9uIHN0YXJ0ZWQuLiIKUzNfQlVDS0VUPSIiClJFR0lPTj0iIgpBVVRPTUFUSU9OX0lEPSIiCklOU1RBTkNFX0lEPSIiCkFDQ09VTlRfSUQ9IiIKT1JDSEVTVFJBVE9SX0FVVE9NQVRJT05fSUQ9IiIKTE9HX0RJUj0iL3Zhci9sb2cvVXNlcmRhdGFTU01BZ2VudEluc3RhbGxhdGlvbiIKVVBMT0FEX0xPQ0FUSU9OPSJzMzovLyRTM19CVUNLRVQvJHtPUkNIRVNUUkFUT1JfQVVUT01BVElPTl9JRH0vdXNlcmRhdGFleGVjdXRpb25sb2dzLyRBQ0NPVU5UX0lELyRSRUdJT04vJHtJTlNUQU5DRV9JRH0vJHtBVVRPTUFUSU9OX0lEfSIKRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSD0iJHtMT0dfRElSfS9sb2dzLnR4dCIKc3VkbyBta2RpciAtcCAke0xPR19ESVJ9CmVjaG8gIkRpcmVjdG9yeSAvdmFyL2xvZy9Vc2VyZGF0YVNTTUFnZW50SW5zdGFsbGF0aW9uLyBjcmVhdGVkIHRvIHN0b3JlIGxvZ3MuIiA+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICmVjaG8gIkRpcmVjdG9yeSAvdmFyL2xvZy9Vc2VyZGF0YVNTTUFnZW50SW5zdGFsbGF0aW9uLyBjcmVhdGVkIHRvIHN0b3JlIGxvZ3MuIgoKc2xlZXAgMwpnZXRfYXJjaApnZXRfcGFja2FnZV9tYW5hZ2VyCmdldF9zZXJ2aWNlX21hbmFnZXIKZ2V0X3NzbV9hZ2VudF9zZXJ2aWNlCgppbnN0YWxsX2RlcGVuZGVuY2llcyBjdXJsIHVuemlwCmluc3RhbGxfYXdzX2NsaQppZiAhIHNzbV9pc19hbHJlYWR5X2luc3RhbGxlZDsgdGhlbgogICAgaW5zdGFsbF9zc21fYWdlbnQKZmkKc3RhcnRfc3NtX2FnZW50CgplY2hvICIiID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICmVjaG8gIiMjIyMgUG9zdCBJbnN0YWxsYXRpb24gQ2hlY2sgIyMjIyIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKZWNobyAiIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAojIFJ1biBkaWFnbm9zdGljcyBhbmQgc2F2ZSBvdXRwdXQKZGlhZ25vc3RpY3Nfb3V0cHV0PSQoc3NtLWNsaSBnZXQtZGlhZ25vc3RpY3MgMj4mMSkKWyAkPyAtbmUgMCBdICYmIGVjaG8gIkVycm9yIHJ1bm5pbmcgc3NtLWNsaSBnZXQtZGlhZ25vc3RpY3M6ICRkaWFnbm9zdGljc19vdXRwdXQiID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICgpmYWlsZWQ9MAoKdmFsaWRhdGVfY2hlY2tzX3N0YXR1cygpIHsKICAgIGxvY2FsIHBhdHRlcm49IiQxIgogICAgbG9jYWwgbWVzc2FnZT0iJDIiCgogICAgaWYgZWNobyAiJGRpYWdub3N0aWNzX291dHB1dCIgfCBncmVwIC1BIDIgIiRwYXR0ZXJuIiB8IGdyZXAgLXEgJyJTdGF0dXMiOiAiRmFpbGVkIic7IHRoZW4KICAgICAgICBpZiBbWyAiJHBhdHRlcm4iID09ICciQ29ubmVjdGl2aXR5IHRvIHNzbSBlbmRwb2ludCInIF1dOyB0aGVuCiAgICAgICAgICAgIGxvY2FsIG5vdGU9JChlY2hvICIkZGlhZ25vc3RpY3Nfb3V0cHV0IiB8IGdyZXAgLUEgMyAiJHBhdHRlcm4iIHwgZ3JlcCAtbyAnIk5vdGUiOiAiW14iXSoiJyB8IGhlYWQgLTEgfCBjdXQgLWQnIicgLWY0KQogICAgICAgICAgICBbWyAtbiAiJG5vdGUiIF1dICYmIG1lc3NhZ2U9IiRtZXNzYWdlIE5vdGU6ICRub3RlIgogICAgICAgIGZpCiAgICAgICAgZWNobyAiW0ZBSUxFRF06ICRtZXNzYWdlIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgICAgIGZhaWxlZD0xCiAgICBmaQp9Cgp2YWxpZGF0ZV9jaGVja3Nfc3RhdHVzICciQ29ubmVjdGl2aXR5IHRvIHNzbSBlbmRwb2ludCInICJDb25uZWN0aXZpdHkgdG8gc3NtIGVuZHBvaW50LiIKdmFsaWRhdGVfY2hlY2tzX3N0YXR1cyAnIkNoZWNrIjogIkFnZW50IHNlcnZpY2UiJyAiQWdlbnQgc2VydmljZSBpcyBub3QgcnVubmluZy4iCnZhbGlkYXRlX2NoZWNrc19zdGF0dXMgJyJFQzIgSU1EUyInICJDb25uZWN0aXZpdHkgdG8gRUMyIElNRFMgZW5kcG9pbnQuIgoKIyBQcmludCBzdWNjZXNzIG1lc3NhZ2UgaWYgbm8gZmFpbHVyZXMKWyAkZmFpbGVkIC1lcSAwIF0gJiYgZWNobyAiW1NVQ0NFU1NdIHNzbS1jbGkgc2hvd2VkIGFnZW50IGlzIHJ1bm5pbmcgYW5kIGNvbm5lY3Rpdml0eSB0byBzc20gZW5kcG9pbnQgcGFzc2VkIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAoKaWYgWyAtZiAiJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgiIF07IHRoZW4KICAgICMgVXBsb2FkIHRoZSBmaWxlIHRvIFMzCiAgICBhd3MgczMgY3AgIiRMT0dfRElSIiAiJFVQTE9BRF9MT0NBVElPTiIgLS1yZWN1cnNpdmUgLS1yZWdpb24gJFJFR0lPTiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSCAyPiYxCgogICAgIyBWYWxpZGF0ZSB0aGUgdXBsb2FkCiAgICBpZiBbICQ/IC1lcSAwIF07IHRoZW4KICAgICAgICBlY2hvICJGaWxlIHVwbG9hZCB0byBTMyBzdWNjZXNzZnVsLiIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgIGVsc2UKICAgICAgICBlY2hvICJGaWxlIHVwbG9hZCB0byBTMyBmYWlsZWQuIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgZmkKZWxzZQogICAgZWNobyAiRmlsZSBub3QgZm91bmQgdG8gdXBsb2FkOiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSCIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKZmkKCgotLS8vLS0="
+                            lin_base64_script = "Q29udGVudC1UeXBlOiBtdWx0aXBhcnQvbWl4ZWQ7IGJvdW5kYXJ5PSIvLyIKTUlNRS1WZXJzaW9uOiAxLjAKCi0tLy8KQ29udGVudC1UeXBlOiB0ZXh0L2Nsb3VkLWNvbmZpZzsgY2hhcnNldD0idXMtYXNjaWkiCk1JTUUtVmVyc2lvbjogMS4wCkNvbnRlbnQtVHJhbnNmZXItRW5jb2Rpbmc6IDdiaXQKQ29udGVudC1EaXNwb3NpdGlvbjogYXR0YWNobWVudDsKIGZpbGVuYW1lPSJjbG91ZC1jb25maWcudHh0IgoKI2Nsb3VkLWNvbmZpZwpjbG91ZF9maW5hbF9tb2R1bGVzOgotIFtzY3JpcHRzLXVzZXIsIGFsd2F5c10KLS0vLwpDb250ZW50LVR5cGU6IHRleHQveC1zaGVsbHNjcmlwdDsgY2hhcnNldD0idXMtYXNjaWkiCk1JTUUtVmVyc2lvbjogMS4wCkNvbnRlbnQtVHJhbnNmZXItRW5jb2Rpbmc6IDdiaXQKQ29udGVudC1EaXNwb3NpdGlvbjogYXR0YWNobWVudDsgZmlsZW5hbWU9InVzZXJkYXRhLnR4dCIKCiMhL2Jpbi9iYXNoCnNldCAtZQoKZXhwb3J0IFBBVEg9Ii91c3IvbG9jYWwvYmluOi91c3IvbG9jYWwvYXdzLWNsaS92Mi9jdXJyZW50L2JpbjokUEFUSCIKCnBhY2thZ2VfZXhpc3RzKCkgewogICAgJCh3aGljaCAiJDEiID4gL2Rldi9udWxsIDI+JjEgKQogICAgcmV0dXJuICQ/Cn0KCmF3c19jbGlfZXhpc3RzKCkgewogICAgIyBDaGVjayBpZiBhd3MgaXMgaW4gUEFUSAogICAgaWYgcGFja2FnZV9leGlzdHMgYXdzOyB0aGVuCiAgICAgICAgcmV0dXJuIDAKICAgIGZpCiAgICAjIENoZWNrIGNvbW1vbiBpbnN0YWxsYXRpb24gbG9jYXRpb25zCiAgICBpZiBbIC1mICIvdXNyL2xvY2FsL2Jpbi9hd3MiIF0gfHwgWyAtZiAiL3Vzci9sb2NhbC9hd3MtY2xpL3YyL2N1cnJlbnQvYmluL2F3cyIgXTsgdGhlbgogICAgICAgIHJldHVybiAwCiAgICBmaQogICAgcmV0dXJuIDEKfQoKaW5zdGFsbF9hd3NfY2xpKCkgewogIGlmIGF3c19jbGlfZXhpc3RzOyB0aGVuCiAgICBlY2hvICJBV1MgQ0xJIGlzIGFscmVhZHkgaW5zdGFsbGVkLiIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgIHJldHVybiAwCiAgZWxzZQogICAgbG9jYWwgYXdzX2NsaV96aXA9Ii90bXAvYXdzY2xpdjIuemlwIgogICAgY3VybCAtLXJldHJ5IDMgLS1mYWlsIC1vICIke2F3c19jbGlfemlwfSIgImh0dHBzOi8vYXdzY2xpLmFtYXpvbmF3cy5jb20vYXdzY2xpLWV4ZS1saW51eC14ODZfNjQuemlwIiA+IC9kZXYvbnVsbCAyPiYxCiAgICBpZiBbICQ/IC1uZSAwIF0gfHwgWyAhIC1mICIke2F3c19jbGlfemlwfSIgXTsgdGhlbgogICAgICAgIGVjaG8gIkZhaWxlZCB0byBkb3dubG9hZCBBV1MgQ0xJIGluc3RhbGxlciIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgICAgICBybSAtZiAiJHthd3NfY2xpX3ppcH0iCiAgICAgICAgcmV0dXJuIDEKICAgIGZpCgogICAgbG9jYWwgdGVtcF9kaXI9Ii90bXAvYXdzLWNsaS1pbnN0YWxsZXIiCiAgICBybSAtcmYgIiR7dGVtcF9kaXJ9IgogICAgbWtkaXIgLXAgIiR7dGVtcF9kaXJ9IgogICAgdW56aXAgLXEgIiR7YXdzX2NsaV96aXB9IiAtZCAiJHt0ZW1wX2Rpcn0iID4gL2Rldi9udWxsIDI+JjEKCiAgICAjIFRyeSBub3JtYWwgaW5zdGFsbCBmaXJzdCwgdGhlbiB0cnkgd2l0aCAtLXVwZGF0ZSBmbGFnIGlmIGl0IGZhaWxzCiAgICBpZiBzdWRvICIke3RlbXBfZGlyfS9hd3MvaW5zdGFsbCIgPiAvZGV2L251bGwgMj4mMTsgdGhlbgogICAgICAgIGVjaG8gIkFXUyBDTEkgaW5zdGFsbGF0aW9uIGNvbXBsZXRlZC4iID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICAgICAgcmV0dXJuIDAKICAgIGVsaWYgc3VkbyAiJHt0ZW1wX2Rpcn0vYXdzL2luc3RhbGwiIC0tdXBkYXRlID4gL2Rldi9udWxsIDI+JjE7IHRoZW4KICAgICAgICBlY2hvICJBV1MgQ0xJIHVwZGF0ZWQgc3VjY2Vzc2Z1bGx5LiIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgICAgICByZXR1cm4gMAogICAgZWxzZQogICAgICAgIGVjaG8gIkFXUyBDTEkgSW5zdGFsbGF0aW9uIEZhaWxlZC4iID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICAgICAgcmV0dXJuIDEKICAgIGZpCiAgZmkKfQoKaW5zdGFsbF9zaW5nbGVfZGVwZW5kZW5jeSgpIHsKICBsb2NhbCBkZXA9IiQxIgogIGlmIHBhY2thZ2VfZXhpc3RzICIkZGVwIjsgdGhlbgogICAgZWNobyAiJGRlcCBpcyBhbHJlYWR5IGluc3RhbGxlZC4iID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICByZXR1cm4gMAogIGZpCgogIGlmIHBhY2thZ2VfZXhpc3RzIHl1bTsgdGhlbgogICAgdGltZW91dCAxODAgeXVtIGluc3RhbGwgLXkgIiRkZXAiCiAgZWxpZiBwYWNrYWdlX2V4aXN0cyB6eXBwZXI7IHRoZW4KICAgIHRpbWVvdXQgMTgwIHp5cHBlciAtbiBpbnN0YWxsICIkZGVwIgogIGVsc2UKICAgIHRpbWVvdXQgMTgwIGFwdC1nZXQgdXBkYXRlICYmIGFwdC1nZXQgaW5zdGFsbCAteSAiJGRlcCIKICBmaQoKICBpZiBbICQ/IC1lcSAwIF07IHRoZW4KICAgIGVjaG8gIiRkZXAgaW5zdGFsbGVkIHN1Y2Nlc3NmdWxseS4iID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICByZXR1cm4gMAogIGVsc2UKICAgIGVjaG8gIkZhaWxlZCB0byBpbnN0YWxsICRkZXAuIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgcmV0dXJuIDEKICBmaQp9CgpnZXRfYXJjaCgpIHsKICAgIGxvY2FsIGFyY2hfdW5hbWUKICAgIGFyY2hfdW5hbWU9JCh1bmFtZSAtbSkKICAgIGNhc2UgJGFyY2hfdW5hbWUgaW4KICAgICJ4ODZfNjQiKQogICAgICAgIGFyY2g9ImFtZDY0IgogICAgICAgIHJldHVybiAwCiAgICAgICAgOzsKICAgICJhYXJjaDY0IikKICAgICAgICBhcmNoPSJhcm02NCIKICAgICAgICByZXR1cm4gMAogICAgICAgIDs7CiAgICAqKQogICAgICAgIGVjaG8gIlVua25vd24gQXJjaGl0ZWN0dXJlIGZvdW5kOiAkYXJjaF91bmFtZSIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgICAgICByZXR1cm4gMQogICAgICAgIDs7CiAgICBlc2FjCn0KCmdldF9wYWNrYWdlX21hbmFnZXIoKSB7CiAgICBpZiBjb21tYW5kIC12IHNuYXA7IHRoZW4KICAgICAgICBwYWNrYWdlX21hbmFnZXI9InNuYXAiCiAgICBlbGlmIGNvbW1hbmQgLXYgZHBrZzsgdGhlbgogICAgICAgIHBhY2thZ2VfbWFuYWdlcj0iZHBrZyIKICAgIGVsaWYgY29tbWFuZCAtdiBkbmY7IHRoZW4KICAgICAgICBwYWNrYWdlX21hbmFnZXI9ImRuZiIKICAgIGVsaWYgY29tbWFuZCAtdiB5dW07IHRoZW4KICAgICAgICBwYWNrYWdlX21hbmFnZXI9Inl1bSIKICAgIGVsaWYgY29tbWFuZCAtdiB6eXBwZXI7IHRoZW4KICAgICAgICBwYWNrYWdlX21hbmFnZXI9Inp5cHBlciIKICAgIGVsc2UKICAgICAgICBlY2hvICJObyBTdXBwb3J0ZWQgUGFja2FnZSBNYW5hZ2VyIEZvdW5kIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgICAgIHJldHVybiAxCiAgICBmaQogICAgcmV0dXJuIDAKfQoKZ2V0X3NlcnZpY2VfbWFuYWdlcigpIHsKICAgIGlmIGNvbW1hbmQgLXYgc3lzdGVtY3RsOyB0aGVuCiAgICAgICAgc2VydmljZV9tYW5hZ2VyPSJzeXN0ZW1jdGwiCiAgICBlbGlmIGNvbW1hbmQgLXYgaW5pdGN0bDsgdGhlbgogICAgICAgIHNlcnZpY2VfbWFuYWdlcj0iaW5pdGN0bCIKICAgIGVsc2UKICAgICAgICBlY2hvICJObyBTdXBwb3J0ZWQgU2VydmljZSBNYW5hZ2VyIEZvdW5kIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgICAgIHJldHVybiAxCiAgICBmaQogICAgcmV0dXJuIDAKfQoKZ2V0X3NzbV9hZ2VudF9zZXJ2aWNlKCkgewogICAgaWYgWyAiJHBhY2thZ2VfbWFuYWdlciIgPSAic25hcCIgXTsgdGhlbgogICAgICAgIHNzbV9hZ2VudF9zZXJ2aWNlPSJzbmFwLmFtYXpvbi1zc20tYWdlbnQuYW1hem9uLXNzbS1hZ2VudCIKICAgIGVsc2UKICAgICAgICBzc21fYWdlbnRfc2VydmljZT0iYW1hem9uLXNzbS1hZ2VudCIKICAgIGZpCiAgICByZXR1cm4gMAp9Cgpzc21faXNfYWxyZWFkeV9pbnN0YWxsZWQoKSB7CiAgICBpZiBbICIkcGFja2FnZV9tYW5hZ2VyIiA9ICJ5dW0iIF0gfHwgWyAiJHBhY2thZ2VfbWFuYWdlciIgPSAienlwcGVyIiBdIHx8IFsgIiRwYWNrYWdlX21hbmFnZXIiID0gImRuZiIgXTsgdGhlbgogICAgICAgIGlmIHJwbSAtcSBhbWF6b24tc3NtLWFnZW50OyB0aGVuCiAgICAgICAgICAgIGVjaG8gIlNTTSBBZ2VudCBpcyBhbHJlYWR5IGluc3RhbGxlZCIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgICAgICAgICAgcmV0dXJuIDAKICAgICAgICBmaQogICAgICAgIHJldHVybiAxCiAgICBlbGlmIFsgIiRwYWNrYWdlX21hbmFnZXIiID0gInNuYXAiIF07IHRoZW4KICAgICAgICBpZiBzbmFwIGxpc3QgYW1hem9uLXNzbS1hZ2VudDsgdGhlbgogICAgICAgICAgICBlY2hvICJTU00gQWdlbnQgaXMgYWxyZWFkeSBpbnN0YWxsZWQiID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICAgICAgICAgIHJldHVybiAwCiAgICAgICAgZmkKICAgICAgICByZXR1cm4gMQogICAgZWxpZiBbICIkcGFja2FnZV9tYW5hZ2VyIiA9ICJkcGtnIiBdOyB0aGVuCiAgICAgICAgaWYgWyAkKGRwa2ctcXVlcnkgLVcgLWY9JyR7U3RhdHVzfScgYW1hem9uLXNzbS1hZ2VudCAyPi9kZXYvbnVsbCB8IGdyZXAgLWMgIm9rIGluc3RhbGxlZCIpIC1uZSAwIF07IHRoZW4KICAgICAgICAgICAgZWNobyAiU1NNIEFnZW50IGlzIGFscmVhZHkgaW5zdGFsbGVkIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgICAgICAgICByZXR1cm4gMAogICAgICAgIGZpCiAgICAgICAgcmV0dXJuIDEKICAgIGVsc2UKICAgICAgICBlY2hvICJObyBTdXBwb3J0ZWQgUGFja2FnZSBNYW5hZ2VyIEZvdW5kLiIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgICAgICByZXR1cm4gMQogICAgZmkKfQoKc3RhcnRfc3NtX2FnZW50KCkgewogICAgaWYgWyAtbiAiJHNlcnZpY2VfbWFuYWdlciIgXSAmJiBbIC1uICIkc3NtX2FnZW50X3NlcnZpY2UiIF07IHRoZW4KICAgICAgICBpZiAhIHN1ZG8gIiRzZXJ2aWNlX21hbmFnZXIiIHN0YXJ0ICIkc3NtX2FnZW50X3NlcnZpY2UiID4gL2Rldi9udWxsIDI+JjE7IHRoZW4KICAgICAgICAgICAgcmV0dXJuIDEKICAgICAgICBmaQogICAgICAgIHJldHVybiAwCiAgICBlbHNlCiAgICAgICAgcmV0dXJuIDEKICAgIGZpCn0KCmluc3RhbGxfc3NtX2FnZW50KCkgewogICAgaWYgWyAiJHBhY2thZ2VfbWFuYWdlciIgPSAic25hcCIgXTsgdGhlbgogICAgICAgIHN1ZG8gc25hcCBpbnN0YWxsIGFtYXpvbi1zc20tYWdlbnQgLS1jbGFzc2ljID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICAgICAgcmV0dXJuIDAKICAgIGZpCgogICAgaWYgWyAiJHBhY2thZ2VfbWFuYWdlciIgPSAiZHBrZyIgXTsgdGhlbgogICAgICAgIGxvY2FsIHNzbV9pbnN0YWxsX3VybD1odHRwczovL3MzLmFtYXpvbmF3cy5jb20vZWMyLWRvd25sb2Fkcy13aW5kb3dzL1NTTUFnZW50L2xhdGVzdC9kZWJpYW5fJHthcmNofS9hbWF6b24tc3NtLWFnZW50LmRlYgogICAgICAgIGxvY2FsIGRlYl9pbnN0YWxsZXJfbG9jYXRpb249L3RtcC9hbWF6b24tc3NtLWFnZW50LmRlYgogICAgICAgIHJtIC1mICIke2RlYl9pbnN0YWxsZXJfbG9jYXRpb259IgoKICAgICAgICBpZiAhIGN1cmwgLS1yZXRyeSAzIC0tZmFpbCAtbyAiJHtkZWJfaW5zdGFsbGVyX2xvY2F0aW9ufSIgIiR7c3NtX2luc3RhbGxfdXJsfSIgPiAvZGV2L251bGwgMj4mMTsgdGhlbgogICAgICAgICAgICBlY2hvICJGYWlsZWQgdG8gZG93bmxvYWQgU1NNIEFnZW50IERlYiBpbnN0YWxsZXIuIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgICAgICAgICByZXR1cm4gMQogICAgICAgIGZpCiAgICBlbHNlCiAgICAgICAgbG9jYWwgc3NtX2luc3RhbGxfdXJsPWh0dHBzOi8vczMuYW1hem9uYXdzLmNvbS9lYzItZG93bmxvYWRzLXdpbmRvd3MvU1NNQWdlbnQvbGF0ZXN0L2xpbnV4XyR7YXJjaH0vYW1hem9uLXNzbS1hZ2VudC5ycG0KICAgICAgICBsb2NhbCBycG1faW5zdGFsbGVyX2xvY2F0aW9uPS90bXAvYW1hem9uLXNzbS1hZ2VudC5ycG0KICAgICAgICBybSAtZiAiJHtycG1faW5zdGFsbGVyX2xvY2F0aW9ufSIKCiAgICAgICAgaWYgISBjdXJsIC0tcmV0cnkgMyAtLWZhaWwgLW8gIiR7cnBtX2luc3RhbGxlcl9sb2NhdGlvbn0iICIke3NzbV9pbnN0YWxsX3VybH0iID4gL2Rldi9udWxsIDI+JjE7IHRoZW4KICAgICAgICAgICAgZWNobyAiRmFpbGVkIHRvIGRvd25sb2FkIFNTTSBBZ2VudCBSUE0gaW5zdGFsbGVyLiIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgICAgICAgICAgcmV0dXJuIDEKICAgICAgICBmaQogICAgZmkKCiAgICBpZiBbICIkcGFja2FnZV9tYW5hZ2VyIiA9ICJ6eXBwZXIiIF07IHRoZW4KICAgICAgICBzdWRvIHp5cHBlciAtLW5vbi1pbnRlcmFjdGl2ZSAtLW5vLWdwZy1jaGVja3MgaW5zdGFsbCAke3JwbV9pbnN0YWxsZXJfbG9jYXRpb259ID4gL2Rldi9udWxsIDI+JjEKICAgIGVsaWYgWyAiJHBhY2thZ2VfbWFuYWdlciIgPSAiZG5mIiBdOyB0aGVuCiAgICAgICAgc3VkbyBkbmYgaW5zdGFsbCAteSAke3JwbV9pbnN0YWxsZXJfbG9jYXRpb259ID4gL2Rldi9udWxsIDI+JjEKICAgIGVsaWYgWyAiJHBhY2thZ2VfbWFuYWdlciIgPSAieXVtIiBdOyB0aGVuCiAgICAgICAgc3VkbyB5dW0gbG9jYWxpbnN0YWxsIC15ICR7cnBtX2luc3RhbGxlcl9sb2NhdGlvbn0gPiAvZGV2L251bGwgMj4mMQogICAgZWxpZiBbICIkcGFja2FnZV9tYW5hZ2VyIiA9ICJkcGtnIiBdOyB0aGVuCiAgICAgICAgc3VkbyBkcGtnIC1pICR7ZGViX2luc3RhbGxlcl9sb2NhdGlvbn0gPiAvZGV2L251bGwgMj4mMQogICAgZWxzZQogICAgICAgIGVjaG8gIk5vIFN1cHBvcnRlZCBQYWNrYWdlIE1hbmFnZXIgRm91bmQiID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICAgICAgcmV0dXJuIDEKICAgIGZpCgogICAgaWYgWyAkPyAtbmUgMCBdOyB0aGVuCiAgICAgICAgZWNobyAiRXJyb3I6IEZhaWxlZCB0byBpbnN0YWxsIFNTTSBBZ2VudC4iID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICAgICAgcmV0dXJuIDEKICAgIGZpCgogICAgc3VkbyBzeXN0ZW1jdGwgZW5hYmxlIGFtYXpvbi1zc20tYWdlbnQgPiAvZGV2L251bGwgMj4mMQogICAgZWNobyAiU3VjY2Vzc2Z1bGx5IEluc3RhbGxlZCBTU00gQWdlbnQuIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgcmV0dXJuIDAKfQoKIyMjIyMjIyMjIyMjIyMgU1RBUlQgIyMjIyMjIyMjIyMjIyMKUzNfQlVDS0VUPSIiClJFR0lPTj0iIgpBVVRPTUFUSU9OX0lEPSIiCklOU1RBTkNFX0lEPSIiCkFDQ09VTlRfSUQ9IiIKT1JDSEVTVFJBVE9SX0FVVE9NQVRJT05fSUQ9IiIKTE9HX0RJUj0iL3Zhci9sb2cvVXNlcmRhdGFTU01BZ2VudEluc3RhbGxhdGlvbiIKVVBMT0FEX0xPQ0FUSU9OPSJzMzovLyRTM19CVUNLRVQvJHtPUkNIRVNUUkFUT1JfQVVUT01BVElPTl9JRH0vdXNlcmRhdGFleGVjdXRpb25sb2dzLyRBQ0NPVU5UX0lELyRSRUdJT04vJHtJTlNUQU5DRV9JRH0vJHtBVVRPTUFUSU9OX0lEfSIKRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSD0iJHtMT0dfRElSfS9sb2dzLnR4dCIKc3VkbyBta2RpciAtcCAke0xPR19ESVJ9CmVjaG8gIkRpcmVjdG9yeSAvdmFyL2xvZy9Vc2VyZGF0YVNTTUFnZW50SW5zdGFsbGF0aW9uLyBjcmVhdGVkIHRvIHN0b3JlIGxvZ3MuIiA+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICgpzbGVlcCAzCmdldF9hcmNoCmdldF9wYWNrYWdlX21hbmFnZXIKZ2V0X3NlcnZpY2VfbWFuYWdlcgpnZXRfc3NtX2FnZW50X3NlcnZpY2UKCmN1cmxfYXZhaWxhYmxlPWZhbHNlCmlmIHBhY2thZ2VfZXhpc3RzIGN1cmwgfHwgaW5zdGFsbF9zaW5nbGVfZGVwZW5kZW5jeSBjdXJsOyB0aGVuCiAgICBjdXJsX2F2YWlsYWJsZT10cnVlCmVsc2UKICAgIGVjaG8gImN1cmwgaXMgbm90IGF2YWlsYWJsZSBhbmQgZmFpbGVkIHRvIGluc3RhbGwuIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSApmaQoKdW56aXBfYXZhaWxhYmxlPWZhbHNlCmlmIHBhY2thZ2VfZXhpc3RzIHVuemlwIHx8IGluc3RhbGxfc2luZ2xlX2RlcGVuZGVuY3kgdW56aXA7IHRoZW4KICAgIHVuemlwX2F2YWlsYWJsZT10cnVlCmVsc2UKICAgIGVjaG8gInVuemlwIGlzIG5vdCBhdmFpbGFibGUgYW5kIGZhaWxlZCB0byBpbnN0YWxsLiIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKZmkKCmF3c19jbGlfaW5zdGFsbGVkPWZhbHNlCmlmICRjdXJsX2F2YWlsYWJsZSAmJiAkdW56aXBfYXZhaWxhYmxlOyB0aGVuCiAgICBpZiBpbnN0YWxsX2F3c19jbGk7IHRoZW4KICAgICAgICBhd3NfY2xpX2luc3RhbGxlZD10cnVlCiAgICBmaQplbGlmIGF3c19jbGlfZXhpc3RzOyB0aGVuCiAgICBhd3NfY2xpX2luc3RhbGxlZD10cnVlCmZpCgppZiAkY3VybF9hdmFpbGFibGU7IHRoZW4KICAgIGlmICEgc3NtX2lzX2FscmVhZHlfaW5zdGFsbGVkOyB0aGVuCiAgICAgICAgaWYgaW5zdGFsbF9zc21fYWdlbnQ7IHRoZW4KICAgICAgICAgICAgZWNobyAiU1NNIEFnZW50IGluc3RhbGxhdGlvbiBzdWNjZXNzZnVsLiIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgICAgICBlbHNlCiAgICAgICAgICAgIGVjaG8gIlNTTSBBZ2VudCBpbnN0YWxsYXRpb24gZmFpbGVkLiIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgICAgICBmaQogICAgZmkKZWxzZQogICAgZWNobyAiU2tpcHBpbmcgU1NNIEFnZW50IGluc3RhbGxhdGlvbiAtIGN1cmwgbm90IGF2YWlsYWJsZS4iID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICmZpCgppZiAhIHN0YXJ0X3NzbV9hZ2VudDsgdGhlbgogICAgOgpmaQoKIyBQb3N0LWluc3RhbGxhdGlvbgppZiBwYWNrYWdlX2V4aXN0cyBzc20tY2xpOyB0aGVuCiAgICBlY2hvICIiID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICBlY2hvICIjIyMjIFBvc3QgSW5zdGFsbGF0aW9uIENoZWNrICMjIyMiID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICBkaWFnbm9zdGljc19vdXRwdXQ9JChzc20tY2xpIGdldC1kaWFnbm9zdGljcyAyPiYxKQogICAgaWYgWyAkPyAtbmUgMCBdOyB0aGVuCiAgICAgICAgZWNobyAiRXJyb3IgcnVubmluZyBzc20tY2xpIGdldC1kaWFnbm9zdGljczogJGRpYWdub3N0aWNzX291dHB1dCIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgIGVsc2UKICAgICAgICBmYWlsZWQ9MAogICAgICAgIGlmIGVjaG8gIiRkaWFnbm9zdGljc19vdXRwdXQiIHwgZ3JlcCAtQSAyICciQ29ubmVjdGl2aXR5IHRvIHNzbSBlbmRwb2ludCInIHwgZ3JlcCAtcSAnIlN0YXR1cyI6ICJGYWlsZWQiJzsgdGhlbgogICAgICAgICAgICBlY2hvICJbRkFJTEVEXTogQ29ubmVjdGl2aXR5IHRvIHNzbSBlbmRwb2ludC4iID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICAgICAgICAgIGZhaWxlZD0xCiAgICAgICAgZmkKICAgICAgICBpZiBlY2hvICIkZGlhZ25vc3RpY3Nfb3V0cHV0IiB8IGdyZXAgLUEgMiAnIkNoZWNrIjogIkFnZW50IHNlcnZpY2UiJyB8IGdyZXAgLXEgJyJTdGF0dXMiOiAiRmFpbGVkIic7IHRoZW4KICAgICAgICAgICAgZWNobyAiW0ZBSUxFRF06IEFnZW50IHNlcnZpY2UgaXMgbm90IHJ1bm5pbmcuIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgICAgICAgICBmYWlsZWQ9MQogICAgICAgIGZpCiAgICAgICAgaWYgZWNobyAiJGRpYWdub3N0aWNzX291dHB1dCIgfCBncmVwIC1BIDIgJyJFQzIgSU1EUyInIHwgZ3JlcCAtcSAnIlN0YXR1cyI6ICJGYWlsZWQiJzsgdGhlbgogICAgICAgICAgICBlY2hvICJbRkFJTEVEXTogQ29ubmVjdGl2aXR5IHRvIEVDMiBJTURTIGVuZHBvaW50LiIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgICAgICAgICAgZmFpbGVkPTEKICAgICAgICBmaQogICAgICAgIFsgJGZhaWxlZCAtZXEgMCBdICYmIGVjaG8gIltTVUNDRVNTXSBzc20tY2xpIHNob3dlZCBhZ2VudCBpcyBydW5uaW5nIGFuZCBjb25uZWN0aXZpdHkgcGFzc2VkIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgZmkKZmkKCiMgVXBsb2FkIGxvZ3MgdG8gUzMKaWYgWyAtZiAiJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgiIF0gJiYgKCRhd3NfY2xpX2luc3RhbGxlZCB8fCBhd3NfY2xpX2V4aXN0cyk7IHRoZW4KICAgIGF3cyBzMyBjcCAiJExPR19ESVIiICIkVVBMT0FEX0xPQ0FUSU9OIiAtLXJlY3Vyc2l2ZSAtLXJlZ2lvbiAkUkVHSU9OID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRIIDI+JjEKICAgIGlmIFsgJD8gLWVxIDAgXTsgdGhlbgogICAgICAgIGVjaG8gIkZpbGUgdXBsb2FkIHRvIFMzIHN1Y2Nlc3NmdWwuIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgZWxzZQogICAgICAgIGVjaG8gIkZpbGUgdXBsb2FkIHRvIFMzIGZhaWxlZC4iID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICBmaQplbHNlCiAgICBlY2hvICJTa2lwcGluZyBTMyB1cGxvYWQgLSBBV1MgQ0xJIG5vdCBhdmFpbGFibGUuIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSApmaQoKLS0vLy0tCg=="
 
                             win_base64_script = '''<persist>true</persist>
                         <powershell>
@@ -1619,7 +1633,7 @@ Resources:
 
                                 if ($Service) {
                                         if ($Service.Status -ne "Running") {
-                                                Write-Log -Message "$ServiceName service is not in Running state. Starting the service" -LogLevel "ERROR"
+                                                Write-Log -Message "$ServiceName service not running. Starting the service" -LogLevel "ERROR"
                                                 Start-Service -Name $ServiceName
                                         }
                                         Get-ServiceStartupMode
@@ -1638,7 +1652,7 @@ Resources:
 
                                 $ServiceStartupMode = (Get-WmiObject Win32_Service -Filter "Name='$ServiceName'").StartMode
                                 if ($ServiceStartupMode -ne "Auto") {
-                                        Write-Log -Message "$ServiceName startup mode is not Automatic. Updating the starting mode to Automatic. " -LogLevel "ERROR"
+                                        Write-Log -Message "$ServiceName startup mode is not Automatic. Changing to Automatic. " -LogLevel "ERROR"
                                         Set-Service -Name $ServiceName -StartupType "Automatic"
                                 }
                         }
@@ -1654,7 +1668,7 @@ Resources:
                                 Start-Process .\AmazonSSMAgentSetup.exe -ArgumentList @("/q", "/log", "install.log") -Wait
                                 $ServiceAvailability = Get-ServiceAvailability
                                 if ($ServiceAvailability -ne 1) {
-                                        Write-Output "Installation of the SSM Agent failed. Please review the logs in $ParentDirectory\log"
+                                        Write-Output "Installation of the SSM Agent failed. Review the logs in $ParentDirectory\log"
                                 }
                                 else {
                                         Write-Log -Message "Successfully Installed SSM Agent."
@@ -1827,8 +1841,7 @@ Resources:
                         InstanceId: '{{ InstanceId }}'
                         ForceReplace: true
                       DocumentName: AWS-AttachIAMToInstance
-                  - description: Start Instance after adding new userdata.
-                    name: StartInstance
+                  - name: StartInstance
                     action: aws:changeInstanceState
                     maxAttempts: 1
                     timeoutSeconds: 900
@@ -1846,8 +1859,7 @@ Resources:
                     isEnd: false
                     inputs:
                       Duration: PT3M
-                  - description: Stops the provided instance.
-                    name: stopInstanceToRestoreUserdata
+                  - name: stopInstanceToRestoreUserdata
                     action: aws:changeInstanceState
                     maxAttempts: 1
                     timeoutSeconds: 900
@@ -1861,8 +1873,7 @@ Resources:
                       InstanceIds:
                         - '{{ InstanceId }}'
                       CheckStateOnly: false
-                  - description: This steps restores the original userdata script of the instance.
-                    name: RestoreUserData
+                  - name: RestoreUserData
                     action: aws:executeAwsApi
                     nextStep: BranchIfPermissionstoRemove
                     isEnd: false
@@ -1906,15 +1917,11 @@ Resources:
                                     ]
                                 )
 
-                                # Check if there are any associations
                                 if response['IamInstanceProfileAssociations']:
                                     for association in response['IamInstanceProfileAssociations']:
-                                        # Check if the profile name matches
                                         if 'SSMAgentInstall-TemporaryInstanceProfile' in association['IamInstanceProfile']['Arn']:
-                                            # Get the association ID
                                             association_id = association['AssociationId']
 
-                                            # Disassociate the profile
                                             ec2.disassociate_iam_instance_profile(
                                                 AssociationId=association_id
                                             )
@@ -2019,8 +2026,9 @@ Resources:
                   - name: FinalOutput
                     action: aws:executeScript
                     maxAttempts: 2
+                    nextStep: ConfirmAgentInstallation
                     isCritical: false
-                    isEnd: true
+                    isEnd: false
                     inputs:
                       Script: |-
                         import boto3
@@ -2102,6 +2110,21 @@ Resources:
                       - Type: String
                         Name: output
                         Selector: $.Payload.output
+                  - description: 'Mark automation status based on Agent Installation. '
+                    name: ConfirmAgentInstallation
+                    action: aws:executeScript
+                    isEnd: true
+                    inputs:
+                      Runtime: python3.11
+                      Handler: script_handler
+                      Script: |-
+                        def script_handler(events, context):
+                            output = events['Finaloutput']
+                            if ("Successfully Installed SSM Agent" not in output and
+                                "Instance is already SSM Managed" not in output):
+                                raise RuntimeError(f"{output}")
+                      InputPayload:
+                        Finaloutput: '{{ FinalOutput.output }}'
                 outputs:
                   - FinalOutput.output
 
