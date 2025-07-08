@@ -13,6 +13,7 @@
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 # SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+---
 AWSTemplateFormatVersion: '2010-09-09'
 Description: AWS CloudFormation template to deploy resources for SSM Agent install automation in multi account setup. This is part of the cloud operations blog.
 Parameters:
@@ -129,7 +130,8 @@ Resources:
                 - ExecutionRoleName: SSMAgentInstall-MAMR-AutomationExecutionRole
                   Regions:
                     - '{{ global:REGION }}'
-                  TargetLocationMaxConcurrency: '5'
+                  TargetLocationMaxConcurrency: '20'
+                  TargetLocationMaxErrors: 100%
                   Accounts:
                     - '{{ TargetAccounts }}'
           - name: GenerateReportS3
@@ -455,7 +457,8 @@ Resources:
                 - ExecutionRoleName: SSMAgentInstall-MAMR-AutomationExecutionRole
                   Regions:
                     - '{{ global:REGION }}'
-                  TargetLocationMaxConcurrency: '5'
+                  TargetLocationMaxConcurrency: '20'
+                  TargetLocationMaxErrors: 100%
                   Accounts:
                     - '{{ GetAccountsIDFromS3Path.UnmanagedAccountIDs }}'
         outputs:
@@ -623,91 +626,77 @@ Resources:
               Default: NoUnmanagedInstances
           - name: AddTagsS3Instances
             action: aws:executeScript
+            onFailure: Continue
             nextStep: BranchIfTagsAdded
             isEnd: false
             inputs:
               Script: |-
-
                 import boto3
                 from botocore.exceptions import ClientError
+                import json
 
                 def chunk_list(lst, chunk_size=999):
-                    """Split list into chunks of specified size"""
                     return [lst[i:i + chunk_size] for i in range(0, len(lst), chunk_size)]
 
                 def add_tags(instances_by_region, updatetags):
-                    successful_instances = {}
-                    failed_instances = {}
-
+                    successful_instances, failed_instances, not_found_instances = {}, {}, {}
                     for region, instances in instances_by_region.items():
                         ec2 = boto3.client('ec2', region_name=region)
-                        successful_instances[region] = []
-                        failed_instances[region] = []
-
+                        successful_instances[region], failed_instances[region], not_found_instances[region] = [], [], []
                         try:
                             for batch in chunk_list(instances, 999):
                                 try:
-                                    ec2.create_tags(
-                                        Resources=batch,
-                                        Tags=updatetags
-                                    )
-                                    successful_instances[region].extend(batch)
-                                except Exception as e:
-                                    failed_instances[region].extend(batch)
-                                    print(f"Failed to add tags to batch in region {region}: {str(e)}")
+                                    response = ec2.describe_instances(InstanceIds=batch)
+                                    existing_instances = []
+                                    for r in response['Reservations']:
+                                        for i in r['Instances']:
+                                            existing_instances.append(i['InstanceId'])
+                                    missing_instances = list(set(batch) - set(existing_instances))
+                                    not_found_instances[region].extend(missing_instances)
+                                    print(not_found_instances)
+                                    if existing_instances:
+                                        try:
+                                            ec2.create_tags(Resources=existing_instances, Tags=updatetags)
+                                            successful_instances[region].extend(existing_instances)
+                                        except Exception as e:
+                                            failed_instances[region].extend(existing_instances)
+                                            print(f"Tag failure {region}: {str(e)}")
+                                except ClientError as e:
+                                    if e.response['Error']['Code'] in ['InvalidInstanceID.NotFound', 'InvalidInstanceID.Malformed']:
+                                        not_found_instances[region].extend(batch)
+                                    else:
+                                        failed_instances[region].extend(batch)
+                                        print(f"Instance check error {region}: {str(e)}")
                         except Exception as e:
-                            print(f"Error processing region {region}: {str(e)}")
-
-                    return successful_instances, failed_instances
+                            print(f"Region error {region}: {str(e)}")
+                    return successful_instances, failed_instances, not_found_instances
 
                 def delete_tags(instances_by_region, updatetags):
-                    successful_deletes = {}
-                    failed_deletes = {}
-
+                    successful_deletes, failed_deletes = {}, {}
                     for region, instances in instances_by_region.items():
                         ec2 = boto3.client('ec2', region_name=region)
-                        successful_deletes[region] = []
-                        failed_deletes[region] = []
-
+                        successful_deletes[region], failed_deletes[region] = [], []
                         for batch in chunk_list(instances, 1000):
                             try:
-                                ec2.delete_tags(
-                                    Resources=batch,
-                                    Tags=updatetags
-                                )
+                                ec2.delete_tags(Resources=batch, Tags=updatetags)
                                 successful_deletes[region].extend(batch)
                             except Exception as e:
                                 failed_deletes[region].extend(batch)
-                                print(f"Failed to remove tags during rollback for batch in region {region}: {str(e)}")
-
+                                print(f"Delete tag failure {region}: {str(e)}")
                     return successful_deletes, failed_deletes
 
                 def script_handler(events, context):
                     execution_id = context['automation:EXECUTION_ID']
                     unmanaged_instances_by_region = events['UnmanagedInstances']
-
-                    custom_tags = [
-                        {
-                            'Key': 'SSMAgentInstall-AutomationExecutionID',
-                            'Value': execution_id
-                        }
-                    ]
-                    successful_instances, failed_instances = add_tags(unmanaged_instances_by_region, custom_tags)
-                    # If any instances failed, rollback the successful ones
+                    custom_tags = [{'Key': 'SSMAgentInstall-AutomationExecutionID', 'Value': execution_id}]
+                    successful_instances, failed_instances, not_found_instances = add_tags(unmanaged_instances_by_region, custom_tags)
+                    not_found_str = json.dumps(not_found_instances)
                     if any(failed_instances.values()):
-                        print(f"Rolling back due to failures in creating tags.")
                         successful_deletes, failed_deletes = delete_tags(successful_instances, custom_tags)
-
-                        return {
-                                'message': 'Tag operation failed and rolled back',
-                                'successful_deletes': successful_deletes,
-                                'failed_deletes': failed_deletes
-                            }
-                    return {
-                            'message': 'Successfully Added Tags',
-                            'successful_deletes': '',
-                            'failed_deletes': ''
-                        }
+                        return {'message': 'Tag operation failed and rolled back', 'successful_deletes': successful_deletes,
+                                'failed_deletes': failed_deletes, 'not_found_instances': not_found_str}
+                    return {'message': 'Successfully Added Tags', 'successful_deletes': '', 'failed_deletes': '',
+                            'not_found_instances': not_found_str}
               Runtime: python3.11
               InputPayload:
                 UnmanagedInstances: '{{ GetInstancesFromS3.UnmanagedInstances }}'
@@ -722,6 +711,9 @@ Resources:
               - Type: String
                 Name: failed_rollbacks
                 Selector: $.Payload.failed_deletes
+              - Type: String
+                Name: not_found_instances
+                Selector: $.Payload.not_found_instances
           - name: executeAutomationOnProvidedTags
             action: aws:executeAutomation
             nextStep: UploadResultsToS3
@@ -745,6 +737,8 @@ Resources:
                     - '{{ TargetRegions }}'
                   TargetsMaxConcurrency: '40'
                   TargetsMaxErrors: '100%'
+                  TargetLocationMaxConcurrency: '20'
+                  TargetLocationMaxErrors: 100%
                   Accounts:
                     - '{{global:ACCOUNT_ID}}'
           - name: BranchIfTagsAdded
@@ -776,7 +770,8 @@ Resources:
                 - ExecutionRoleName: SSMAgentInstall-MAMR-AutomationExecutionRole
                   Regions:
                     - '{{ GetInstancesFromS3.UnmanagedRegions}}'
-                  TargetLocationMaxConcurrency: '3'
+                  TargetLocationMaxConcurrency: '20'
+                  TargetLocationMaxErrors: 100%
                   TargetsMaxConcurrency: '40'
                   TargetsMaxErrors: '100%'
                   Accounts:
@@ -1620,7 +1615,7 @@ Resources:
                                     updated_script = base64.b64encode(script.encode('utf-8')).decode('utf-8')
                                 return updated_script
 
-                            lin_base64_script = "Q29udGVudC1UeXBlOiBtdWx0aXBhcnQvbWl4ZWQ7IGJvdW5kYXJ5PSIvLyIKTUlNRS1WZXJzaW9uOiAxLjAKCi0tLy8KQ29udGVudC1UeXBlOiB0ZXh0L2Nsb3VkLWNvbmZpZzsgY2hhcnNldD0idXMtYXNjaWkiCk1JTUUtVmVyc2lvbjogMS4wCkNvbnRlbnQtVHJhbnNmZXItRW5jb2Rpbmc6IDdiaXQKQ29udGVudC1EaXNwb3NpdGlvbjogYXR0YWNobWVudDsKIGZpbGVuYW1lPSJjbG91ZC1jb25maWcudHh0IgoKI2Nsb3VkLWNvbmZpZwpjbG91ZF9maW5hbF9tb2R1bGVzOgotIFtzY3JpcHRzLXVzZXIsIGFsd2F5c10KLS0vLwpDb250ZW50LVR5cGU6IHRleHQveC1zaGVsbHNjcmlwdDsgY2hhcnNldD0idXMtYXNjaWkiCk1JTUUtVmVyc2lvbjogMS4wCkNvbnRlbnQtVHJhbnNmZXItRW5jb2Rpbmc6IDdiaXQKQ29udGVudC1EaXNwb3NpdGlvbjogYXR0YWNobWVudDsgZmlsZW5hbWU9InVzZXJkYXRhLnR4dCIKCiMhL2Jpbi9iYXNoCnNldCAtZQoKZXhwb3J0IFBBVEg9Ii91c3IvbG9jYWwvYmluOi91c3IvbG9jYWwvYXdzLWNsaS92Mi9jdXJyZW50L2JpbjokUEFUSCIKCnBhY2thZ2VfZXhpc3RzKCkgewogICAgJCh3aGljaCAiJDEiID4gL2Rldi9udWxsIDI+JjEgKQogICAgcmV0dXJuICQ/Cn0KCmF3c19jbGlfZXhpc3RzKCkgewogICAgIyBDaGVjayBpZiBhd3MgaXMgaW4gUEFUSAogICAgaWYgcGFja2FnZV9leGlzdHMgYXdzOyB0aGVuCiAgICAgICAgcmV0dXJuIDAKICAgIGZpCiAgICAjIENoZWNrIGNvbW1vbiBpbnN0YWxsYXRpb24gbG9jYXRpb25zCiAgICBpZiBbIC1mICIvdXNyL2xvY2FsL2Jpbi9hd3MiIF0gfHwgWyAtZiAiL3Vzci9sb2NhbC9hd3MtY2xpL3YyL2N1cnJlbnQvYmluL2F3cyIgXTsgdGhlbgogICAgICAgIHJldHVybiAwCiAgICBmaQogICAgcmV0dXJuIDEKfQoKaW5zdGFsbF9hd3NfY2xpKCkgewogIGlmIGF3c19jbGlfZXhpc3RzOyB0aGVuCiAgICBlY2hvICJBV1MgQ0xJIGlzIGFscmVhZHkgaW5zdGFsbGVkLiIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgIHJldHVybiAwCiAgZWxzZQogICAgbG9jYWwgYXdzX2NsaV96aXA9Ii90bXAvYXdzY2xpdjIuemlwIgogICAgY3VybCAtLXJldHJ5IDMgLS1mYWlsIC1vICIke2F3c19jbGlfemlwfSIgImh0dHBzOi8vYXdzY2xpLmFtYXpvbmF3cy5jb20vYXdzY2xpLWV4ZS1saW51eC14ODZfNjQuemlwIiA+IC9kZXYvbnVsbCAyPiYxCiAgICBpZiBbICQ/IC1uZSAwIF0gfHwgWyAhIC1mICIke2F3c19jbGlfemlwfSIgXTsgdGhlbgogICAgICAgIGVjaG8gIkZhaWxlZCB0byBkb3dubG9hZCBBV1MgQ0xJIGluc3RhbGxlciIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgICAgICBybSAtZiAiJHthd3NfY2xpX3ppcH0iCiAgICAgICAgcmV0dXJuIDEKICAgIGZpCgogICAgbG9jYWwgdGVtcF9kaXI9Ii90bXAvYXdzLWNsaS1pbnN0YWxsZXIiCiAgICBybSAtcmYgIiR7dGVtcF9kaXJ9IgogICAgbWtkaXIgLXAgIiR7dGVtcF9kaXJ9IgogICAgdW56aXAgLXEgIiR7YXdzX2NsaV96aXB9IiAtZCAiJHt0ZW1wX2Rpcn0iID4gL2Rldi9udWxsIDI+JjEKCiAgICAjIFRyeSBub3JtYWwgaW5zdGFsbCBmaXJzdCwgdGhlbiB0cnkgd2l0aCAtLXVwZGF0ZSBmbGFnIGlmIGl0IGZhaWxzCiAgICBpZiBzdWRvICIke3RlbXBfZGlyfS9hd3MvaW5zdGFsbCIgPiAvZGV2L251bGwgMj4mMTsgdGhlbgogICAgICAgIGVjaG8gIkFXUyBDTEkgaW5zdGFsbGF0aW9uIGNvbXBsZXRlZC4iID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICAgICAgcmV0dXJuIDAKICAgIGVsaWYgc3VkbyAiJHt0ZW1wX2Rpcn0vYXdzL2luc3RhbGwiIC0tdXBkYXRlID4gL2Rldi9udWxsIDI+JjE7IHRoZW4KICAgICAgICBlY2hvICJBV1MgQ0xJIHVwZGF0ZWQgc3VjY2Vzc2Z1bGx5LiIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgICAgICByZXR1cm4gMAogICAgZWxzZQogICAgICAgIGVjaG8gIkFXUyBDTEkgSW5zdGFsbGF0aW9uIEZhaWxlZC4iID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICAgICAgcmV0dXJuIDEKICAgIGZpCiAgZmkKfQoKaW5zdGFsbF9zaW5nbGVfZGVwZW5kZW5jeSgpIHsKICBsb2NhbCBkZXA9IiQxIgogIGlmIHBhY2thZ2VfZXhpc3RzICIkZGVwIjsgdGhlbgogICAgZWNobyAiJGRlcCBpcyBhbHJlYWR5IGluc3RhbGxlZC4iID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICByZXR1cm4gMAogIGZpCgogIGlmIHBhY2thZ2VfZXhpc3RzIHl1bTsgdGhlbgogICAgdGltZW91dCAxODAgeXVtIGluc3RhbGwgLXkgIiRkZXAiCiAgZWxpZiBwYWNrYWdlX2V4aXN0cyB6eXBwZXI7IHRoZW4KICAgIHRpbWVvdXQgMTgwIHp5cHBlciAtbiBpbnN0YWxsICIkZGVwIgogIGVsc2UKICAgIHRpbWVvdXQgMTgwIGFwdC1nZXQgdXBkYXRlICYmIGFwdC1nZXQgaW5zdGFsbCAteSAiJGRlcCIKICBmaQoKICBpZiBbICQ/IC1lcSAwIF07IHRoZW4KICAgIGVjaG8gIiRkZXAgaW5zdGFsbGVkIHN1Y2Nlc3NmdWxseS4iID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICByZXR1cm4gMAogIGVsc2UKICAgIGVjaG8gIkZhaWxlZCB0byBpbnN0YWxsICRkZXAuIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgcmV0dXJuIDEKICBmaQp9CgpnZXRfYXJjaCgpIHsKICAgIGxvY2FsIGFyY2hfdW5hbWUKICAgIGFyY2hfdW5hbWU9JCh1bmFtZSAtbSkKICAgIGNhc2UgJGFyY2hfdW5hbWUgaW4KICAgICJ4ODZfNjQiKQogICAgICAgIGFyY2g9ImFtZDY0IgogICAgICAgIHJldHVybiAwCiAgICAgICAgOzsKICAgICJhYXJjaDY0IikKICAgICAgICBhcmNoPSJhcm02NCIKICAgICAgICByZXR1cm4gMAogICAgICAgIDs7CiAgICAqKQogICAgICAgIGVjaG8gIlVua25vd24gQXJjaGl0ZWN0dXJlIGZvdW5kOiAkYXJjaF91bmFtZSIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgICAgICByZXR1cm4gMQogICAgICAgIDs7CiAgICBlc2FjCn0KCmdldF9wYWNrYWdlX21hbmFnZXIoKSB7CiAgICBpZiBjb21tYW5kIC12IHNuYXA7IHRoZW4KICAgICAgICBwYWNrYWdlX21hbmFnZXI9InNuYXAiCiAgICBlbGlmIGNvbW1hbmQgLXYgZHBrZzsgdGhlbgogICAgICAgIHBhY2thZ2VfbWFuYWdlcj0iZHBrZyIKICAgIGVsaWYgY29tbWFuZCAtdiBkbmY7IHRoZW4KICAgICAgICBwYWNrYWdlX21hbmFnZXI9ImRuZiIKICAgIGVsaWYgY29tbWFuZCAtdiB5dW07IHRoZW4KICAgICAgICBwYWNrYWdlX21hbmFnZXI9Inl1bSIKICAgIGVsaWYgY29tbWFuZCAtdiB6eXBwZXI7IHRoZW4KICAgICAgICBwYWNrYWdlX21hbmFnZXI9Inp5cHBlciIKICAgIGVsc2UKICAgICAgICBlY2hvICJObyBTdXBwb3J0ZWQgUGFja2FnZSBNYW5hZ2VyIEZvdW5kIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgICAgIHJldHVybiAxCiAgICBmaQogICAgcmV0dXJuIDAKfQoKZ2V0X3NlcnZpY2VfbWFuYWdlcigpIHsKICAgIGlmIGNvbW1hbmQgLXYgc3lzdGVtY3RsOyB0aGVuCiAgICAgICAgc2VydmljZV9tYW5hZ2VyPSJzeXN0ZW1jdGwiCiAgICBlbGlmIGNvbW1hbmQgLXYgaW5pdGN0bDsgdGhlbgogICAgICAgIHNlcnZpY2VfbWFuYWdlcj0iaW5pdGN0bCIKICAgIGVsc2UKICAgICAgICBlY2hvICJObyBTdXBwb3J0ZWQgU2VydmljZSBNYW5hZ2VyIEZvdW5kIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgICAgIHJldHVybiAxCiAgICBmaQogICAgcmV0dXJuIDAKfQoKZ2V0X3NzbV9hZ2VudF9zZXJ2aWNlKCkgewogICAgaWYgWyAiJHBhY2thZ2VfbWFuYWdlciIgPSAic25hcCIgXTsgdGhlbgogICAgICAgIHNzbV9hZ2VudF9zZXJ2aWNlPSJzbmFwLmFtYXpvbi1zc20tYWdlbnQuYW1hem9uLXNzbS1hZ2VudCIKICAgIGVsc2UKICAgICAgICBzc21fYWdlbnRfc2VydmljZT0iYW1hem9uLXNzbS1hZ2VudCIKICAgIGZpCiAgICByZXR1cm4gMAp9Cgpzc21faXNfYWxyZWFkeV9pbnN0YWxsZWQoKSB7CiAgICBpZiBbICIkcGFja2FnZV9tYW5hZ2VyIiA9ICJ5dW0iIF0gfHwgWyAiJHBhY2thZ2VfbWFuYWdlciIgPSAienlwcGVyIiBdIHx8IFsgIiRwYWNrYWdlX21hbmFnZXIiID0gImRuZiIgXTsgdGhlbgogICAgICAgIGlmIHJwbSAtcSBhbWF6b24tc3NtLWFnZW50OyB0aGVuCiAgICAgICAgICAgIGVjaG8gIlNTTSBBZ2VudCBpcyBhbHJlYWR5IGluc3RhbGxlZCIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgICAgICAgICAgcmV0dXJuIDAKICAgICAgICBmaQogICAgICAgIHJldHVybiAxCiAgICBlbGlmIFsgIiRwYWNrYWdlX21hbmFnZXIiID0gInNuYXAiIF07IHRoZW4KICAgICAgICBpZiBzbmFwIGxpc3QgYW1hem9uLXNzbS1hZ2VudDsgdGhlbgogICAgICAgICAgICBlY2hvICJTU00gQWdlbnQgaXMgYWxyZWFkeSBpbnN0YWxsZWQiID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICAgICAgICAgIHJldHVybiAwCiAgICAgICAgZmkKICAgICAgICByZXR1cm4gMQogICAgZWxpZiBbICIkcGFja2FnZV9tYW5hZ2VyIiA9ICJkcGtnIiBdOyB0aGVuCiAgICAgICAgaWYgWyAkKGRwa2ctcXVlcnkgLVcgLWY9JyR7U3RhdHVzfScgYW1hem9uLXNzbS1hZ2VudCAyPi9kZXYvbnVsbCB8IGdyZXAgLWMgIm9rIGluc3RhbGxlZCIpIC1uZSAwIF07IHRoZW4KICAgICAgICAgICAgZWNobyAiU1NNIEFnZW50IGlzIGFscmVhZHkgaW5zdGFsbGVkIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgICAgICAgICByZXR1cm4gMAogICAgICAgIGZpCiAgICAgICAgcmV0dXJuIDEKICAgIGVsc2UKICAgICAgICBlY2hvICJObyBTdXBwb3J0ZWQgUGFja2FnZSBNYW5hZ2VyIEZvdW5kLiIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgICAgICByZXR1cm4gMQogICAgZmkKfQoKc3RhcnRfc3NtX2FnZW50KCkgewogICAgaWYgWyAtbiAiJHNlcnZpY2VfbWFuYWdlciIgXSAmJiBbIC1uICIkc3NtX2FnZW50X3NlcnZpY2UiIF07IHRoZW4KICAgICAgICBpZiAhIHN1ZG8gIiRzZXJ2aWNlX21hbmFnZXIiIHN0YXJ0ICIkc3NtX2FnZW50X3NlcnZpY2UiID4gL2Rldi9udWxsIDI+JjE7IHRoZW4KICAgICAgICAgICAgcmV0dXJuIDEKICAgICAgICBmaQogICAgICAgIHJldHVybiAwCiAgICBlbHNlCiAgICAgICAgcmV0dXJuIDEKICAgIGZpCn0KCmluc3RhbGxfc3NtX2FnZW50KCkgewogICAgaWYgWyAiJHBhY2thZ2VfbWFuYWdlciIgPSAic25hcCIgXTsgdGhlbgogICAgICAgIHN1ZG8gc25hcCBpbnN0YWxsIGFtYXpvbi1zc20tYWdlbnQgLS1jbGFzc2ljID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICAgICAgcmV0dXJuIDAKICAgIGZpCgogICAgaWYgWyAiJHBhY2thZ2VfbWFuYWdlciIgPSAiZHBrZyIgXTsgdGhlbgogICAgICAgIGxvY2FsIHNzbV9pbnN0YWxsX3VybD1odHRwczovL3MzLmFtYXpvbmF3cy5jb20vZWMyLWRvd25sb2Fkcy13aW5kb3dzL1NTTUFnZW50L2xhdGVzdC9kZWJpYW5fJHthcmNofS9hbWF6b24tc3NtLWFnZW50LmRlYgogICAgICAgIGxvY2FsIGRlYl9pbnN0YWxsZXJfbG9jYXRpb249L3RtcC9hbWF6b24tc3NtLWFnZW50LmRlYgogICAgICAgIHJtIC1mICIke2RlYl9pbnN0YWxsZXJfbG9jYXRpb259IgoKICAgICAgICBpZiAhIGN1cmwgLS1yZXRyeSAzIC0tZmFpbCAtbyAiJHtkZWJfaW5zdGFsbGVyX2xvY2F0aW9ufSIgIiR7c3NtX2luc3RhbGxfdXJsfSIgPiAvZGV2L251bGwgMj4mMTsgdGhlbgogICAgICAgICAgICBlY2hvICJGYWlsZWQgdG8gZG93bmxvYWQgU1NNIEFnZW50IERlYiBpbnN0YWxsZXIuIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgICAgICAgICByZXR1cm4gMQogICAgICAgIGZpCiAgICBlbHNlCiAgICAgICAgbG9jYWwgc3NtX2luc3RhbGxfdXJsPWh0dHBzOi8vczMuYW1hem9uYXdzLmNvbS9lYzItZG93bmxvYWRzLXdpbmRvd3MvU1NNQWdlbnQvbGF0ZXN0L2xpbnV4XyR7YXJjaH0vYW1hem9uLXNzbS1hZ2VudC5ycG0KICAgICAgICBsb2NhbCBycG1faW5zdGFsbGVyX2xvY2F0aW9uPS90bXAvYW1hem9uLXNzbS1hZ2VudC5ycG0KICAgICAgICBybSAtZiAiJHtycG1faW5zdGFsbGVyX2xvY2F0aW9ufSIKCiAgICAgICAgaWYgISBjdXJsIC0tcmV0cnkgMyAtLWZhaWwgLW8gIiR7cnBtX2luc3RhbGxlcl9sb2NhdGlvbn0iICIke3NzbV9pbnN0YWxsX3VybH0iID4gL2Rldi9udWxsIDI+JjE7IHRoZW4KICAgICAgICAgICAgZWNobyAiRmFpbGVkIHRvIGRvd25sb2FkIFNTTSBBZ2VudCBSUE0gaW5zdGFsbGVyLiIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgICAgICAgICAgcmV0dXJuIDEKICAgICAgICBmaQogICAgZmkKCiAgICBpZiBbICIkcGFja2FnZV9tYW5hZ2VyIiA9ICJ6eXBwZXIiIF07IHRoZW4KICAgICAgICBzdWRvIHp5cHBlciAtLW5vbi1pbnRlcmFjdGl2ZSAtLW5vLWdwZy1jaGVja3MgaW5zdGFsbCAke3JwbV9pbnN0YWxsZXJfbG9jYXRpb259ID4gL2Rldi9udWxsIDI+JjEKICAgIGVsaWYgWyAiJHBhY2thZ2VfbWFuYWdlciIgPSAiZG5mIiBdOyB0aGVuCiAgICAgICAgc3VkbyBkbmYgaW5zdGFsbCAteSAke3JwbV9pbnN0YWxsZXJfbG9jYXRpb259ID4gL2Rldi9udWxsIDI+JjEKICAgIGVsaWYgWyAiJHBhY2thZ2VfbWFuYWdlciIgPSAieXVtIiBdOyB0aGVuCiAgICAgICAgc3VkbyB5dW0gbG9jYWxpbnN0YWxsIC15ICR7cnBtX2luc3RhbGxlcl9sb2NhdGlvbn0gPiAvZGV2L251bGwgMj4mMQogICAgZWxpZiBbICIkcGFja2FnZV9tYW5hZ2VyIiA9ICJkcGtnIiBdOyB0aGVuCiAgICAgICAgc3VkbyBkcGtnIC1pICR7ZGViX2luc3RhbGxlcl9sb2NhdGlvbn0gPiAvZGV2L251bGwgMj4mMQogICAgZWxzZQogICAgICAgIGVjaG8gIk5vIFN1cHBvcnRlZCBQYWNrYWdlIE1hbmFnZXIgRm91bmQiID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICAgICAgcmV0dXJuIDEKICAgIGZpCgogICAgaWYgWyAkPyAtbmUgMCBdOyB0aGVuCiAgICAgICAgZWNobyAiRXJyb3I6IEZhaWxlZCB0byBpbnN0YWxsIFNTTSBBZ2VudC4iID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICAgICAgcmV0dXJuIDEKICAgIGZpCgogICAgc3VkbyBzeXN0ZW1jdGwgZW5hYmxlIGFtYXpvbi1zc20tYWdlbnQgPiAvZGV2L251bGwgMj4mMQogICAgZWNobyAiU3VjY2Vzc2Z1bGx5IEluc3RhbGxlZCBTU00gQWdlbnQuIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgcmV0dXJuIDAKfQoKIyMjIyMjIyMjIyMjIyMgU1RBUlQgIyMjIyMjIyMjIyMjIyMKUzNfQlVDS0VUPSIiClJFR0lPTj0iIgpBVVRPTUFUSU9OX0lEPSIiCklOU1RBTkNFX0lEPSIiCkFDQ09VTlRfSUQ9IiIKT1JDSEVTVFJBVE9SX0FVVE9NQVRJT05fSUQ9IiIKTE9HX0RJUj0iL3Zhci9sb2cvVXNlcmRhdGFTU01BZ2VudEluc3RhbGxhdGlvbiIKVVBMT0FEX0xPQ0FUSU9OPSJzMzovLyRTM19CVUNLRVQvJHtPUkNIRVNUUkFUT1JfQVVUT01BVElPTl9JRH0vdXNlcmRhdGFleGVjdXRpb25sb2dzLyRBQ0NPVU5UX0lELyRSRUdJT04vJHtJTlNUQU5DRV9JRH0vJHtBVVRPTUFUSU9OX0lEfSIKRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSD0iJHtMT0dfRElSfS9sb2dzLnR4dCIKc3VkbyBta2RpciAtcCAke0xPR19ESVJ9CmVjaG8gIkRpcmVjdG9yeSAvdmFyL2xvZy9Vc2VyZGF0YVNTTUFnZW50SW5zdGFsbGF0aW9uLyBjcmVhdGVkIHRvIHN0b3JlIGxvZ3MuIiA+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICgpzbGVlcCAzCmdldF9hcmNoCmdldF9wYWNrYWdlX21hbmFnZXIKZ2V0X3NlcnZpY2VfbWFuYWdlcgpnZXRfc3NtX2FnZW50X3NlcnZpY2UKCmN1cmxfYXZhaWxhYmxlPWZhbHNlCmlmIHBhY2thZ2VfZXhpc3RzIGN1cmwgfHwgaW5zdGFsbF9zaW5nbGVfZGVwZW5kZW5jeSBjdXJsOyB0aGVuCiAgICBjdXJsX2F2YWlsYWJsZT10cnVlCmVsc2UKICAgIGVjaG8gImN1cmwgaXMgbm90IGF2YWlsYWJsZSBhbmQgZmFpbGVkIHRvIGluc3RhbGwuIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSApmaQoKdW56aXBfYXZhaWxhYmxlPWZhbHNlCmlmIHBhY2thZ2VfZXhpc3RzIHVuemlwIHx8IGluc3RhbGxfc2luZ2xlX2RlcGVuZGVuY3kgdW56aXA7IHRoZW4KICAgIHVuemlwX2F2YWlsYWJsZT10cnVlCmVsc2UKICAgIGVjaG8gInVuemlwIGlzIG5vdCBhdmFpbGFibGUgYW5kIGZhaWxlZCB0byBpbnN0YWxsLiIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKZmkKCmF3c19jbGlfaW5zdGFsbGVkPWZhbHNlCmlmICRjdXJsX2F2YWlsYWJsZSAmJiAkdW56aXBfYXZhaWxhYmxlOyB0aGVuCiAgICBpZiBpbnN0YWxsX2F3c19jbGk7IHRoZW4KICAgICAgICBhd3NfY2xpX2luc3RhbGxlZD10cnVlCiAgICBmaQplbGlmIGF3c19jbGlfZXhpc3RzOyB0aGVuCiAgICBhd3NfY2xpX2luc3RhbGxlZD10cnVlCmZpCgppZiAkY3VybF9hdmFpbGFibGU7IHRoZW4KICAgIGlmICEgc3NtX2lzX2FscmVhZHlfaW5zdGFsbGVkOyB0aGVuCiAgICAgICAgaWYgaW5zdGFsbF9zc21fYWdlbnQ7IHRoZW4KICAgICAgICAgICAgZWNobyAiU1NNIEFnZW50IGluc3RhbGxhdGlvbiBzdWNjZXNzZnVsLiIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgICAgICBlbHNlCiAgICAgICAgICAgIGVjaG8gIlNTTSBBZ2VudCBpbnN0YWxsYXRpb24gZmFpbGVkLiIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgICAgICBmaQogICAgZmkKZWxzZQogICAgZWNobyAiU2tpcHBpbmcgU1NNIEFnZW50IGluc3RhbGxhdGlvbiAtIGN1cmwgbm90IGF2YWlsYWJsZS4iID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICmZpCgppZiAhIHN0YXJ0X3NzbV9hZ2VudDsgdGhlbgogICAgOgpmaQoKIyBQb3N0LWluc3RhbGxhdGlvbgppZiBwYWNrYWdlX2V4aXN0cyBzc20tY2xpOyB0aGVuCiAgICBlY2hvICIiID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICBlY2hvICIjIyMjIFBvc3QgSW5zdGFsbGF0aW9uIENoZWNrICMjIyMiID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICBkaWFnbm9zdGljc19vdXRwdXQ9JChzc20tY2xpIGdldC1kaWFnbm9zdGljcyAyPiYxKQogICAgaWYgWyAkPyAtbmUgMCBdOyB0aGVuCiAgICAgICAgZWNobyAiRXJyb3IgcnVubmluZyBzc20tY2xpIGdldC1kaWFnbm9zdGljczogJGRpYWdub3N0aWNzX291dHB1dCIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgIGVsc2UKICAgICAgICBmYWlsZWQ9MAogICAgICAgIGlmIGVjaG8gIiRkaWFnbm9zdGljc19vdXRwdXQiIHwgZ3JlcCAtQSAyICciQ29ubmVjdGl2aXR5IHRvIHNzbSBlbmRwb2ludCInIHwgZ3JlcCAtcSAnIlN0YXR1cyI6ICJGYWlsZWQiJzsgdGhlbgogICAgICAgICAgICBlY2hvICJbRkFJTEVEXTogQ29ubmVjdGl2aXR5IHRvIHNzbSBlbmRwb2ludC4iID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICAgICAgICAgIGZhaWxlZD0xCiAgICAgICAgZmkKICAgICAgICBpZiBlY2hvICIkZGlhZ25vc3RpY3Nfb3V0cHV0IiB8IGdyZXAgLUEgMiAnIkNoZWNrIjogIkFnZW50IHNlcnZpY2UiJyB8IGdyZXAgLXEgJyJTdGF0dXMiOiAiRmFpbGVkIic7IHRoZW4KICAgICAgICAgICAgZWNobyAiW0ZBSUxFRF06IEFnZW50IHNlcnZpY2UgaXMgbm90IHJ1bm5pbmcuIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgICAgICAgICBmYWlsZWQ9MQogICAgICAgIGZpCiAgICAgICAgaWYgZWNobyAiJGRpYWdub3N0aWNzX291dHB1dCIgfCBncmVwIC1BIDIgJyJFQzIgSU1EUyInIHwgZ3JlcCAtcSAnIlN0YXR1cyI6ICJGYWlsZWQiJzsgdGhlbgogICAgICAgICAgICBlY2hvICJbRkFJTEVEXTogQ29ubmVjdGl2aXR5IHRvIEVDMiBJTURTIGVuZHBvaW50LiIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgICAgICAgICAgZmFpbGVkPTEKICAgICAgICBmaQogICAgICAgIFsgJGZhaWxlZCAtZXEgMCBdICYmIGVjaG8gIltTVUNDRVNTXSBzc20tY2xpIHNob3dlZCBhZ2VudCBpcyBydW5uaW5nIGFuZCBjb25uZWN0aXZpdHkgcGFzc2VkIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgZmkKZmkKCiMgVXBsb2FkIGxvZ3MgdG8gUzMKaWYgWyAtZiAiJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgiIF0gJiYgKCRhd3NfY2xpX2luc3RhbGxlZCB8fCBhd3NfY2xpX2V4aXN0cyk7IHRoZW4KICAgIGF3cyBzMyBjcCAiJExPR19ESVIiICIkVVBMT0FEX0xPQ0FUSU9OIiAtLXJlY3Vyc2l2ZSAtLXJlZ2lvbiAkUkVHSU9OID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRIIDI+JjEKICAgIGlmIFsgJD8gLWVxIDAgXTsgdGhlbgogICAgICAgIGVjaG8gIkZpbGUgdXBsb2FkIHRvIFMzIHN1Y2Nlc3NmdWwuIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgZWxzZQogICAgICAgIGVjaG8gIkZpbGUgdXBsb2FkIHRvIFMzIGZhaWxlZC4iID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICBmaQplbHNlCiAgICBlY2hvICJTa2lwcGluZyBTMyB1cGxvYWQgLSBBV1MgQ0xJIG5vdCBhdmFpbGFibGUuIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSApmaQoKLS0vLy0tCg=="
+                            lin_base64_script = "Q29udGVudC1UeXBlOiBtdWx0aXBhcnQvbWl4ZWQ7IGJvdW5kYXJ5PSIvLyIKTUlNRS1WZXJzaW9uOiAxLjAKCi0tLy8KQ29udGVudC1UeXBlOiB0ZXh0L2Nsb3VkLWNvbmZpZzsgY2hhcnNldD0idXMtYXNjaWkiCk1JTUUtVmVyc2lvbjogMS4wCkNvbnRlbnQtVHJhbnNmZXItRW5jb2Rpbmc6IDdiaXQKQ29udGVudC1EaXNwb3NpdGlvbjogYXR0YWNobWVudDsKIGZpbGVuYW1lPSJjbG91ZC1jb25maWcudHh0IgoKI2Nsb3VkLWNvbmZpZwpjbG91ZF9maW5hbF9tb2R1bGVzOgotIFtzY3JpcHRzLXVzZXIsIGFsd2F5c10KLS0vLwpDb250ZW50LVR5cGU6IHRleHQveC1zaGVsbHNjcmlwdDsgY2hhcnNldD0idXMtYXNjaWkiCk1JTUUtVmVyc2lvbjogMS4wCkNvbnRlbnQtVHJhbnNmZXItRW5jb2Rpbmc6IDdiaXQKQ29udGVudC1EaXNwb3NpdGlvbjogYXR0YWNobWVudDsgZmlsZW5hbWU9InVzZXJkYXRhLnR4dCIKCiMhL2Jpbi9iYXNoCnNldCAtZQoKZXhwb3J0IFBBVEg9Ii91c3IvbG9jYWwvYmluOi91c3IvbG9jYWwvYXdzLWNsaS92Mi9jdXJyZW50L2JpbjokUEFUSCIKCnBhY2thZ2VfZXhpc3RzKCkgewogICAgJCh3aGljaCAiJDEiID4gL2Rldi9udWxsIDI+JjEgKQogICAgcmV0dXJuICQ/Cn0KCmF3c19jbGlfZXhpc3RzKCkgewogICAgIyBDaGVjayBpZiBhd3MgaXMgaW4gUEFUSAogICAgaWYgcGFja2FnZV9leGlzdHMgYXdzOyB0aGVuCiAgICAgICAgcmV0dXJuIDAKICAgIGZpCiAgICAjIENoZWNrIGNvbW1vbiBpbnN0YWxsYXRpb24gbG9jYXRpb25zCiAgICBpZiBbIC1mICIvdXNyL2xvY2FsL2Jpbi9hd3MiIF0gfHwgWyAtZiAiL3Vzci9sb2NhbC9hd3MtY2xpL3YyL2N1cnJlbnQvYmluL2F3cyIgXTsgdGhlbgogICAgICAgIHJldHVybiAwCiAgICBmaQogICAgcmV0dXJuIDEKfQoKaW5zdGFsbF9hd3NfY2xpKCkgewogIGlmIGF3c19jbGlfZXhpc3RzOyB0aGVuCiAgICBlY2hvICJBV1MgQ0xJIGlzIGFscmVhZHkgaW5zdGFsbGVkLiIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgIHJldHVybiAwCiAgZWxzZQogICAgbG9jYWwgYXdzX2NsaV96aXA9Ii90bXAvYXdzY2xpdjIuemlwIgogICAgY3VybCAtLXJldHJ5IDMgLS1mYWlsIC1vICIke2F3c19jbGlfemlwfSIgImh0dHBzOi8vYXdzY2xpLmFtYXpvbmF3cy5jb20vYXdzY2xpLWV4ZS1saW51eC14ODZfNjQuemlwIiA+IC9kZXYvbnVsbCAyPiYxCiAgICBpZiBbICQ/IC1uZSAwIF0gfHwgWyAhIC1mICIke2F3c19jbGlfemlwfSIgXTsgdGhlbgogICAgICAgIGVjaG8gIkZhaWxlZCB0byBkb3dubG9hZCBBV1MgQ0xJIGluc3RhbGxlciIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgICAgICBybSAtZiAiJHthd3NfY2xpX3ppcH0iCiAgICAgICAgcmV0dXJuIDEKICAgIGZpCgogICAgbG9jYWwgdGVtcF9kaXI9Ii90bXAvYXdzLWNsaS1pbnN0YWxsZXIiCiAgICBybSAtcmYgIiR7dGVtcF9kaXJ9IgogICAgbWtkaXIgLXAgIiR7dGVtcF9kaXJ9IgogICAgdW56aXAgLXEgIiR7YXdzX2NsaV96aXB9IiAtZCAiJHt0ZW1wX2Rpcn0iID4gL2Rldi9udWxsIDI+JjEKCiAgICAjIFRyeSBub3JtYWwgaW5zdGFsbCBmaXJzdCwgdGhlbiB0cnkgd2l0aCAtLXVwZGF0ZSBmbGFnIGlmIGl0IGZhaWxzCiAgICBpZiBzdWRvICIke3RlbXBfZGlyfS9hd3MvaW5zdGFsbCIgPiAvZGV2L251bGwgMj4mMTsgdGhlbgogICAgICAgIGVjaG8gIkFXUyBDTEkgaW5zdGFsbGF0aW9uIGNvbXBsZXRlZC4iID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICAgICAgcmV0dXJuIDAKICAgIGVsaWYgc3VkbyAiJHt0ZW1wX2Rpcn0vYXdzL2luc3RhbGwiIC0tdXBkYXRlID4gL2Rldi9udWxsIDI+JjE7IHRoZW4KICAgICAgICBlY2hvICJBV1MgQ0xJIHVwZGF0ZWQgc3VjY2Vzc2Z1bGx5LiIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgICAgICByZXR1cm4gMAogICAgZWxzZQogICAgICAgIGVjaG8gIkFXUyBDTEkgSW5zdGFsbGF0aW9uIEZhaWxlZC4iID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICAgICAgcmV0dXJuIDEKICAgIGZpCiAgZmkKfQoKaW5zdGFsbF9zaW5nbGVfZGVwZW5kZW5jeSgpIHsKICBsb2NhbCBkZXA9IiQxIgogIGlmIHBhY2thZ2VfZXhpc3RzICIkZGVwIjsgdGhlbgogICAgZWNobyAiJGRlcCBpcyBhbHJlYWR5IGluc3RhbGxlZC4iID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICByZXR1cm4gMAogIGZpCgogIGlmIHBhY2thZ2VfZXhpc3RzIHl1bTsgdGhlbgogICAgdGltZW91dCAxODAgeXVtIGluc3RhbGwgLXkgIiRkZXAiCiAgZWxpZiBwYWNrYWdlX2V4aXN0cyB6eXBwZXI7IHRoZW4KICAgIHRpbWVvdXQgMTgwIHp5cHBlciAtbiBpbnN0YWxsICIkZGVwIgogIGVsc2UKICAgIHRpbWVvdXQgMTgwIGFwdC1nZXQgdXBkYXRlICYmIGFwdC1nZXQgaW5zdGFsbCAteSAiJGRlcCIKICBmaQoKICBpZiBbICQ/IC1lcSAwIF07IHRoZW4KICAgIGVjaG8gIiRkZXAgaW5zdGFsbGVkIHN1Y2Nlc3NmdWxseS4iID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICByZXR1cm4gMAogIGVsc2UKICAgIGVjaG8gIkZhaWxlZCB0byBpbnN0YWxsICRkZXAuIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgcmV0dXJuIDEKICBmaQp9CgpnZXRfYXJjaCgpIHsKICAgIGxvY2FsIGFyY2hfdW5hbWUKICAgIGFyY2hfdW5hbWU9JCh1bmFtZSAtbSkKICAgIGNhc2UgJGFyY2hfdW5hbWUgaW4KICAgICJ4ODZfNjQiKQogICAgICAgIGFyY2g9ImFtZDY0IgogICAgICAgIHJldHVybiAwCiAgICAgICAgOzsKICAgICJhYXJjaDY0IikKICAgICAgICBhcmNoPSJhcm02NCIKICAgICAgICByZXR1cm4gMAogICAgICAgIDs7CiAgICAqKQogICAgICAgIGVjaG8gIlVua25vd24gQXJjaGl0ZWN0dXJlIGZvdW5kOiAkYXJjaF91bmFtZSIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgICAgICByZXR1cm4gMQogICAgICAgIDs7CiAgICBlc2FjCn0KCmdldF9wYWNrYWdlX21hbmFnZXIoKSB7CiAgICBpZiBjb21tYW5kIC12IHNuYXA7IHRoZW4KICAgICAgICBwYWNrYWdlX21hbmFnZXI9InNuYXAiCiAgICBlbGlmIGNvbW1hbmQgLXYgZHBrZzsgdGhlbgogICAgICAgIHBhY2thZ2VfbWFuYWdlcj0iZHBrZyIKICAgIGVsaWYgY29tbWFuZCAtdiBkbmY7IHRoZW4KICAgICAgICBwYWNrYWdlX21hbmFnZXI9ImRuZiIKICAgIGVsaWYgY29tbWFuZCAtdiB5dW07IHRoZW4KICAgICAgICBwYWNrYWdlX21hbmFnZXI9Inl1bSIKICAgIGVsaWYgY29tbWFuZCAtdiB6eXBwZXI7IHRoZW4KICAgICAgICBwYWNrYWdlX21hbmFnZXI9Inp5cHBlciIKICAgIGVsc2UKICAgICAgICBlY2hvICJObyBTdXBwb3J0ZWQgUGFja2FnZSBNYW5hZ2VyIEZvdW5kIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgICAgIHJldHVybiAxCiAgICBmaQogICAgcmV0dXJuIDAKfQoKZ2V0X3NlcnZpY2VfbWFuYWdlcigpIHsKICAgIGlmIGNvbW1hbmQgLXYgc3lzdGVtY3RsOyB0aGVuCiAgICAgICAgc2VydmljZV9tYW5hZ2VyPSJzeXN0ZW1jdGwiCiAgICBlbGlmIGNvbW1hbmQgLXYgaW5pdGN0bDsgdGhlbgogICAgICAgIHNlcnZpY2VfbWFuYWdlcj0iaW5pdGN0bCIKICAgIGVsc2UKICAgICAgICBlY2hvICJObyBTdXBwb3J0ZWQgU2VydmljZSBNYW5hZ2VyIEZvdW5kIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgICAgIHJldHVybiAxCiAgICBmaQogICAgcmV0dXJuIDAKfQoKZ2V0X3NzbV9hZ2VudF9zZXJ2aWNlKCkgewogICAgaWYgWyAiJHBhY2thZ2VfbWFuYWdlciIgPSAic25hcCIgXTsgdGhlbgogICAgICAgIHNzbV9hZ2VudF9zZXJ2aWNlPSJzbmFwLmFtYXpvbi1zc20tYWdlbnQuYW1hem9uLXNzbS1hZ2VudCIKICAgIGVsc2UKICAgICAgICBzc21fYWdlbnRfc2VydmljZT0iYW1hem9uLXNzbS1hZ2VudCIKICAgIGZpCiAgICByZXR1cm4gMAp9Cgpzc21faXNfYWxyZWFkeV9pbnN0YWxsZWQoKSB7CiAgICBpZiBbICIkcGFja2FnZV9tYW5hZ2VyIiA9ICJ5dW0iIF0gfHwgWyAiJHBhY2thZ2VfbWFuYWdlciIgPSAienlwcGVyIiBdIHx8IFsgIiRwYWNrYWdlX21hbmFnZXIiID0gImRuZiIgXTsgdGhlbgogICAgICAgIGlmIHJwbSAtcSBhbWF6b24tc3NtLWFnZW50OyB0aGVuCiAgICAgICAgICAgIGVjaG8gIlNTTSBBZ2VudCBpcyBhbHJlYWR5IGluc3RhbGxlZCIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgICAgICAgICAgcmV0dXJuIDAKICAgICAgICBmaQogICAgICAgIHJldHVybiAxCiAgICBlbGlmIFsgIiRwYWNrYWdlX21hbmFnZXIiID0gInNuYXAiIF07IHRoZW4KICAgICAgICBpZiBzbmFwIGxpc3QgYW1hem9uLXNzbS1hZ2VudDsgdGhlbgogICAgICAgICAgICBlY2hvICJTU00gQWdlbnQgaXMgYWxyZWFkeSBpbnN0YWxsZWQiID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICAgICAgICAgIHJldHVybiAwCiAgICAgICAgZmkKICAgICAgICByZXR1cm4gMQogICAgZWxpZiBbICIkcGFja2FnZV9tYW5hZ2VyIiA9ICJkcGtnIiBdOyB0aGVuCiAgICAgICAgaWYgWyAkKGRwa2ctcXVlcnkgLVcgLWY9JyR7U3RhdHVzfScgYW1hem9uLXNzbS1hZ2VudCAyPi9kZXYvbnVsbCB8IGdyZXAgLWMgIm9rIGluc3RhbGxlZCIpIC1uZSAwIF07IHRoZW4KICAgICAgICAgICAgZWNobyAiU1NNIEFnZW50IGlzIGFscmVhZHkgaW5zdGFsbGVkIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgICAgICAgICByZXR1cm4gMAogICAgICAgIGZpCiAgICAgICAgcmV0dXJuIDEKICAgIGVsc2UKICAgICAgICBlY2hvICJObyBTdXBwb3J0ZWQgUGFja2FnZSBNYW5hZ2VyIEZvdW5kLiIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgICAgICByZXR1cm4gMQogICAgZmkKfQoKc3RhcnRfc3NtX2FnZW50KCkgewogICAgaWYgWyAtbiAiJHNlcnZpY2VfbWFuYWdlciIgXSAmJiBbIC1uICIkc3NtX2FnZW50X3NlcnZpY2UiIF07IHRoZW4KICAgICAgICBpZiAhIHN1ZG8gIiRzZXJ2aWNlX21hbmFnZXIiIHN0YXJ0ICIkc3NtX2FnZW50X3NlcnZpY2UiID4gL2Rldi9udWxsIDI+JjE7IHRoZW4KICAgICAgICAgICAgcmV0dXJuIDEKICAgICAgICBmaQogICAgICAgIHJldHVybiAwCiAgICBlbHNlCiAgICAgICAgcmV0dXJuIDEKICAgIGZpCn0KCmluc3RhbGxfc3NtX2FnZW50KCkgewogICAgaWYgWyAiJHBhY2thZ2VfbWFuYWdlciIgPSAic25hcCIgXTsgdGhlbgogICAgICAgIHN1ZG8gc25hcCBpbnN0YWxsIGFtYXpvbi1zc20tYWdlbnQgLS1jbGFzc2ljID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICAgICAgcmV0dXJuIDAKICAgIGZpCgogICAgaWYgWyAiJHBhY2thZ2VfbWFuYWdlciIgPSAiZHBrZyIgXTsgdGhlbgogICAgICAgIGxvY2FsIHNzbV9pbnN0YWxsX3VybD1odHRwczovL3MzLmFtYXpvbmF3cy5jb20vZWMyLWRvd25sb2Fkcy13aW5kb3dzL1NTTUFnZW50L2xhdGVzdC9kZWJpYW5fJHthcmNofS9hbWF6b24tc3NtLWFnZW50LmRlYgogICAgICAgIGxvY2FsIGRlYl9pbnN0YWxsZXJfbG9jYXRpb249L3RtcC9hbWF6b24tc3NtLWFnZW50LmRlYgogICAgICAgIHJtIC1mICIke2RlYl9pbnN0YWxsZXJfbG9jYXRpb259IgoKICAgICAgICBpZiAhIGN1cmwgLS1yZXRyeSAzIC0tZmFpbCAtbyAiJHtkZWJfaW5zdGFsbGVyX2xvY2F0aW9ufSIgIiR7c3NtX2luc3RhbGxfdXJsfSIgPiAvZGV2L251bGwgMj4mMTsgdGhlbgogICAgICAgICAgICBlY2hvICJGYWlsZWQgdG8gZG93bmxvYWQgU1NNIEFnZW50IERlYiBpbnN0YWxsZXIuIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgICAgICAgICByZXR1cm4gMQogICAgICAgIGZpCiAgICBlbHNlCiAgICAgICAgbG9jYWwgc3NtX2luc3RhbGxfdXJsPWh0dHBzOi8vczMuYW1hem9uYXdzLmNvbS9lYzItZG93bmxvYWRzLXdpbmRvd3MvU1NNQWdlbnQvbGF0ZXN0L2xpbnV4XyR7YXJjaH0vYW1hem9uLXNzbS1hZ2VudC5ycG0KICAgICAgICBsb2NhbCBycG1faW5zdGFsbGVyX2xvY2F0aW9uPS90bXAvYW1hem9uLXNzbS1hZ2VudC5ycG0KICAgICAgICBybSAtZiAiJHtycG1faW5zdGFsbGVyX2xvY2F0aW9ufSIKCiAgICAgICAgaWYgISBjdXJsIC0tcmV0cnkgMyAtLWZhaWwgLW8gIiR7cnBtX2luc3RhbGxlcl9sb2NhdGlvbn0iICIke3NzbV9pbnN0YWxsX3VybH0iID4gL2Rldi9udWxsIDI+JjE7IHRoZW4KICAgICAgICAgICAgZWNobyAiRmFpbGVkIHRvIGRvd25sb2FkIFNTTSBBZ2VudCBSUE0gaW5zdGFsbGVyLiIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgICAgICAgICAgcmV0dXJuIDEKICAgICAgICBmaQogICAgZmkKCiAgICBpZiBbICIkcGFja2FnZV9tYW5hZ2VyIiA9ICJ6eXBwZXIiIF07IHRoZW4KICAgICAgICBzdWRvIHp5cHBlciAtLW5vbi1pbnRlcmFjdGl2ZSAtLW5vLWdwZy1jaGVja3MgaW5zdGFsbCAke3JwbV9pbnN0YWxsZXJfbG9jYXRpb259ID4gL2Rldi9udWxsIDI+JjEKICAgIGVsaWYgWyAiJHBhY2thZ2VfbWFuYWdlciIgPSAiZG5mIiBdOyB0aGVuCiAgICAgICAgc3VkbyBkbmYgaW5zdGFsbCAteSAke3JwbV9pbnN0YWxsZXJfbG9jYXRpb259ID4gL2Rldi9udWxsIDI+JjEKICAgIGVsaWYgWyAiJHBhY2thZ2VfbWFuYWdlciIgPSAieXVtIiBdOyB0aGVuCiAgICAgICAgc3VkbyB5dW0gbG9jYWxpbnN0YWxsIC15ICR7cnBtX2luc3RhbGxlcl9sb2NhdGlvbn0gPiAvZGV2L251bGwgMj4mMQogICAgZWxpZiBbICIkcGFja2FnZV9tYW5hZ2VyIiA9ICJkcGtnIiBdOyB0aGVuCiAgICAgICAgc3VkbyBkcGtnIC1pICR7ZGViX2luc3RhbGxlcl9sb2NhdGlvbn0gPiAvZGV2L251bGwgMj4mMQogICAgZWxzZQogICAgICAgIGVjaG8gIk5vIFN1cHBvcnRlZCBQYWNrYWdlIE1hbmFnZXIgRm91bmQiID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICAgICAgcmV0dXJuIDEKICAgIGZpCgogICAgaWYgWyAkPyAtbmUgMCBdOyB0aGVuCiAgICAgICAgZWNobyAiRXJyb3I6IEZhaWxlZCB0byBpbnN0YWxsIFNTTSBBZ2VudC4iID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICAgICAgcmV0dXJuIDEKICAgIGZpCgogICAgc3VkbyBzeXN0ZW1jdGwgZW5hYmxlIGFtYXpvbi1zc20tYWdlbnQgPiAvZGV2L251bGwgMj4mMQogICAgZWNobyAiU3VjY2Vzc2Z1bGx5IEluc3RhbGxlZCBTU00gQWdlbnQuIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgcmV0dXJuIDAKfQoKIyMjIyMjIyMjIyMjIyMgU1RBUlQgIyMjIyMjIyMjIyMjIyMKUzNfQlVDS0VUPSIiClJFR0lPTj0iIgpBVVRPTUFUSU9OX0lEPSIiCklOU1RBTkNFX0lEPSIiCkFDQ09VTlRfSUQ9IiIKT1JDSEVTVFJBVE9SX0FVVE9NQVRJT05fSUQ9IiIKTE9HX0RJUj0iL3Zhci9sb2cvVXNlcmRhdGFTU01BZ2VudEluc3RhbGxhdGlvbiIKVVBMT0FEX0xPQ0FUSU9OPSJzMzovLyRTM19CVUNLRVQvJHtPUkNIRVNUUkFUT1JfQVVUT01BVElPTl9JRH0vdXNlcmRhdGFleGVjdXRpb25sb2dzLyRBQ0NPVU5UX0lELyRSRUdJT04vJHtJTlNUQU5DRV9JRH0vJHtBVVRPTUFUSU9OX0lEfSIKRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSD0iJHtMT0dfRElSfS9sb2dzLnR4dCIKc3VkbyBta2RpciAtcCAke0xPR19ESVJ9CmVjaG8gIkRpcmVjdG9yeSAvdmFyL2xvZy9Vc2VyZGF0YVNTTUFnZW50SW5zdGFsbGF0aW9uLyBjcmVhdGVkIHRvIHN0b3JlIGxvZ3MuIiA+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICgpzbGVlcCAzCmdldF9hcmNoCmdldF9wYWNrYWdlX21hbmFnZXIKZ2V0X3NlcnZpY2VfbWFuYWdlcgpnZXRfc3NtX2FnZW50X3NlcnZpY2UKCmN1cmxfYXZhaWxhYmxlPWZhbHNlCmlmIHBhY2thZ2VfZXhpc3RzIGN1cmwgfHwgaW5zdGFsbF9zaW5nbGVfZGVwZW5kZW5jeSBjdXJsOyB0aGVuCiAgICBjdXJsX2F2YWlsYWJsZT10cnVlCmVsc2UKICAgIGVjaG8gImN1cmwgaXMgbm90IGF2YWlsYWJsZSBhbmQgZmFpbGVkIHRvIGluc3RhbGwuIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSApmaQoKdW56aXBfYXZhaWxhYmxlPWZhbHNlCmlmIHBhY2thZ2VfZXhpc3RzIHVuemlwIHx8IGluc3RhbGxfc2luZ2xlX2RlcGVuZGVuY3kgdW56aXA7IHRoZW4KICAgIHVuemlwX2F2YWlsYWJsZT10cnVlCmVsc2UKICAgIGVjaG8gInVuemlwIGlzIG5vdCBhdmFpbGFibGUgYW5kIGZhaWxlZCB0byBpbnN0YWxsLiIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKZmkKCmF3c19jbGlfaW5zdGFsbGVkPWZhbHNlCmlmICRjdXJsX2F2YWlsYWJsZSAmJiAkdW56aXBfYXZhaWxhYmxlOyB0aGVuCiAgICBpZiBpbnN0YWxsX2F3c19jbGk7IHRoZW4KICAgICAgICBhd3NfY2xpX2luc3RhbGxlZD10cnVlCiAgICBmaQplbGlmIGF3c19jbGlfZXhpc3RzOyB0aGVuCiAgICBhd3NfY2xpX2luc3RhbGxlZD10cnVlCmZpCgppZiAkY3VybF9hdmFpbGFibGU7IHRoZW4KICAgIGlmICEgc3NtX2lzX2FscmVhZHlfaW5zdGFsbGVkOyB0aGVuCiAgICAgICAgaWYgaW5zdGFsbF9zc21fYWdlbnQ7IHRoZW4KICAgICAgICAgICAgZWNobyAiU1NNIEFnZW50IGluc3RhbGxhdGlvbiBzdWNjZXNzZnVsLiIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgICAgICBlbHNlCiAgICAgICAgICAgIGVjaG8gIlNTTSBBZ2VudCBpbnN0YWxsYXRpb24gZmFpbGVkLiIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgICAgICBmaQogICAgZmkKZWxzZQogICAgZWNobyAiU2tpcHBpbmcgU1NNIEFnZW50IGluc3RhbGxhdGlvbiAtIGN1cmwgbm90IGF2YWlsYWJsZS4iID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICmZpCgppZiAhIHN0YXJ0X3NzbV9hZ2VudDsgdGhlbgogICAgOgpmaQoKIyBQb3N0LWluc3RhbGxhdGlvbgppZiBwYWNrYWdlX2V4aXN0cyBzc20tY2xpOyB0aGVuCiAgICBlY2hvICIiID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICBlY2hvICIjIyMjIFBvc3QgSW5zdGFsbGF0aW9uIENoZWNrICMjIyMiID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICBkaWFnbm9zdGljc19vdXRwdXQ9JChzc20tY2xpIGdldC1kaWFnbm9zdGljcyAyPiYxKQogICAgaWYgWyAkPyAtbmUgMCBdOyB0aGVuCiAgICAgICAgZWNobyAiRXJyb3IgcnVubmluZyBzc20tY2xpIGdldC1kaWFnbm9zdGljczogJGRpYWdub3N0aWNzX291dHB1dCIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgIGVsc2UKICAgICAgICBmYWlsZWQ9MAogICAgICAgIGlmIGVjaG8gIiRkaWFnbm9zdGljc19vdXRwdXQiIHwgZ3JlcCAtQSAyICciQ29ubmVjdGl2aXR5IHRvIHNzbSBlbmRwb2ludCInIHwgZ3JlcCAtcSAnIlN0YXR1cyI6ICJGYWlsZWQiJzsgdGhlbgogICAgICAgICAgICBlY2hvICJbRkFJTEVEXTogQ29ubmVjdGl2aXR5IHRvIHNzbSBlbmRwb2ludC4iID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICAgICAgICAgIGZhaWxlZD0xCiAgICAgICAgZmkKICAgICAgICBpZiBlY2hvICIkZGlhZ25vc3RpY3Nfb3V0cHV0IiB8IGdyZXAgLUEgMiAnIkNoZWNrIjogIkFnZW50IHNlcnZpY2UiJyB8IGdyZXAgLXEgJyJTdGF0dXMiOiAiRmFpbGVkIic7IHRoZW4KICAgICAgICAgICAgZWNobyAiW0ZBSUxFRF06IEFnZW50IHNlcnZpY2UgaXMgbm90IHJ1bm5pbmcuIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgICAgICAgICBmYWlsZWQ9MQogICAgICAgIGZpCiAgICAgICAgaWYgZWNobyAiJGRpYWdub3N0aWNzX291dHB1dCIgfCBncmVwIC1BIDIgJyJFQzIgSU1EUyInIHwgZ3JlcCAtcSAnIlN0YXR1cyI6ICJGYWlsZWQiJzsgdGhlbgogICAgICAgICAgICBlY2hvICJbRkFJTEVEXTogQ29ubmVjdGl2aXR5IHRvIEVDMiBJTURTIGVuZHBvaW50LiIgPj4gJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgKICAgICAgICAgICAgZmFpbGVkPTEKICAgICAgICBmaQogICAgICAgIFsgJGZhaWxlZCAtZXEgMCBdICYmIGVjaG8gIltTVUNDRVNTXSBzc20tY2xpIHNob3dlZCBhZ2VudCBpcyBydW5uaW5nIGFuZCBjb25uZWN0aXZpdHkgdG8gc3NtIGVuZHBvaW50IGFuZCBFQzIgSU1EUyBwYXNzZWQuIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgZmkKZmkKCiMgVXBsb2FkIGxvZ3MgdG8gUzMKaWYgWyAtZiAiJEVYRUNVVElPTl9MT0dGSUxFX1BBVEgiIF0gJiYgKCRhd3NfY2xpX2luc3RhbGxlZCB8fCBhd3NfY2xpX2V4aXN0cyk7IHRoZW4KICAgIGF3cyBzMyBjcCAiJExPR19ESVIiICIkVVBMT0FEX0xPQ0FUSU9OIiAtLXJlY3Vyc2l2ZSAtLXJlZ2lvbiAkUkVHSU9OID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRIIDI+JjEKICAgIGlmIFsgJD8gLWVxIDAgXTsgdGhlbgogICAgICAgIGVjaG8gIkZpbGUgdXBsb2FkIHRvIFMzIHN1Y2Nlc3NmdWwuIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSAogICAgZWxzZQogICAgICAgIGVjaG8gIkZpbGUgdXBsb2FkIHRvIFMzIGZhaWxlZC4iID4+ICRFWEVDVVRJT05fTE9HRklMRV9QQVRICiAgICBmaQplbHNlCiAgICBlY2hvICJTa2lwcGluZyBTMyB1cGxvYWQgLSBBV1MgQ0xJIG5vdCBhdmFpbGFibGUuIiA+PiAkRVhFQ1VUSU9OX0xPR0ZJTEVfUEFUSApmaQoKLS0vLy0tCg=="
 
                             win_base64_script = '''<persist>true</persist>
                         <powershell>
@@ -1807,7 +1802,7 @@ Resources:
                         $Ec2metadataCheck = Get-CheckStatus -CheckType "EC2 IMDS" 6>> $LogsDestination
 
                         If ($EndpointCheck -eq "Pass" -And $AgentCheck -eq "Pass" -And $Ec2metadataCheck -eq "Pass") {
-                          Write-Log -Message "[SUCCESS] ssm-cli showed agent is running and connectivity to ssm endpoint passed" 6>> $LogsDestination
+                          Write-Log -Message "[SUCCESS] ssm-cli showed agent is running and connectivity to to ssm endpoint and EC2 IMDS passed." 6>> $LogsDestination
                         }
 
                         $result = Test-AWSPowerShellWriteS3ObjectCommand 6>> $LogsDestination

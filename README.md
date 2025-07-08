@@ -136,6 +136,11 @@ amazon-ssm-agent-3.3.2471.0-1.x86_64
 [SKIPPED]: Instance does not meet the prerequisites: The instance i-0a20de6d9b7299c15 is a spot instance. Exiting.
 ```
 
+```
+Couldn't find userdata logs in the S3 bucket. It is possible the installation was complete but log upload failed from the instance. Confirm if the instance is now managed from Fleet Manager console. You can check the Execution Log file under C:\Windows\TEMP\ssm\log
+```
+The last error message may occur when no logs were pushed from the instance. This can happen for various reasons, there is no cloud-init installed or running, Upload to s3 failed due to permissions or connectivity issue. Login to the instance and verify if log file is created under /var/log/UserdataSSMAgentInstallation/ or C:\Windows\TEMP\ssm\log.
+
 ### Which instances are targeted when using Diagnose and Remediate output?
 From the DiagnoseAndRemediateS3Results parameter, the automation reads the CSV file and filters for unmanaged instances with "Unidentified Issues". "Unidentified Issues" means the instance's issue found doesn't belong to any of the categories defined in the [EC2 diagnosis category types documentation](https://docs.aws.amazon.com/systems-manager/latest/userguide/diagnosing-ec2-category-types.html).
 
