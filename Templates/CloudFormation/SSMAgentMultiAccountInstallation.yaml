@@ -1647,10 +1647,11 @@ Resources:
                                                 Start-Service -Name $ServiceName
                                         }
                                         Get-ServiceStartupMode
-                                        return 1
+                                        return $true
                                 }
                                 else {
                                         Write-Log -Message "The $ServiceName service is not available." -LogLevel "ERROR"
+                                        return $false
                                 }
                         }
 
@@ -1677,8 +1678,9 @@ Resources:
                                 (New-Object System.Net.WebClient).DownloadFile("https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/windows_amd64/AmazonSSMAgentSetup.exe", $ParentDirectory + "\AmazonSSMAgentSetup.exe")
                                 Start-Process .\AmazonSSMAgentSetup.exe -ArgumentList @("/q", "/log", "install.log") -Wait
                                 $ServiceAvailability = Get-ServiceAvailability
-                                if ($ServiceAvailability -ne 1) {
+                                if (-not ($ServiceAvailability)) {
                                         Write-Output "Installation of the SSM Agent failed. Review the logs in $ParentDirectory\log"
+                                        Write-Log "Installation of the SSM Agent failed. Review the logs in $ParentDirectory\log"
                                 }
                                 else {
                                         Write-Log -Message "Successfully Installed SSM Agent."
@@ -2131,7 +2133,7 @@ Resources:
                         def script_handler(events, context):
                             output = events['Finaloutput']
                             if ("Successfully Installed SSM Agent" not in output and
-                                "Instance is already SSM Managed" not in output):
+                                "Instance is already SSM Managed" not in output and "SSM Agent is already installed" not in output):
                                 raise RuntimeError(f"{output}")
                       InputPayload:
                         Finaloutput: '{{ FinalOutput.output }}'
