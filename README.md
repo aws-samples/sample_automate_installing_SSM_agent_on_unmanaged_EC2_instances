@@ -1,6 +1,6 @@
 # Automate installing SSM agent on unmanaged EC2 instances in an AWS Organization
 
-This repo hosts templates written for the AWS Blog Post "[Automate installing AWS Systems Manager agent on unmanaged Amazon EC2 nodes]([https://aws.amazon.com/blogs/mt/](https://aws.amazon.com/blogs/mt/automate-installing-ssm-agent-on-unmanaged-ec2-instances-in-an-aws-organization/))" published on the [AWS Cloud Operations & Migrations](https://aws.amazon.com/blogs/mt/) blog channel.
+This repo hosts templates written for the AWS Blog Post [Automate installing AWS Systems Manager agent on unmanaged Amazon EC2 nodes](https://aws.amazon.com/blogs/mt/automate-installing-ssm-agent-on-unmanaged-ec2-instances-in-an-aws-organization/) published on the [AWS Cloud Operations & Migrations](https://aws.amazon.com/blogs/mt/) blog channel.
 
 For details on how to use the corresponding CloudFormation templates, refer to the blog post.
 
