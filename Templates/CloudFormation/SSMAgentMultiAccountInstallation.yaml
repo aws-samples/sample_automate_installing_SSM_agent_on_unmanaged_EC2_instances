@@ -106,7 +106,7 @@ Resources:
               Script: |-
                 def script_handler(events, context):
                   return {'message': 'No Target Key/value or Path to s3 diagnosis and Results is provided. Either of the two must be provided.'}
-              Runtime: python3.11
+              Runtime: python3.12
               Handler: script_handler
             outputs:
               - Type: String
@@ -286,7 +286,7 @@ Resources:
                     except Exception as e:
                         print(f"Lambda execution failed: {str(e)}")
                         raise
-              Runtime: python3.11
+              Runtime: python3.12
               InputPayload:
                 s3logs: '{{ UploadLogsToS3Bucket }}'
               Handler: lambda_handler
@@ -405,7 +405,7 @@ Resources:
                         return {"status": "error", "message": f"S3 error: {str(e)}"}
                     except Exception as e:
                         return {"status": "error", "message": f"Error processing file: {str(e)}"}
-              Runtime: python3.11
+              Runtime: python3.12
               InputPayload:
                 DiagnoseS3Path: '{{ DiagnoseAndRemediateS3Results }}'
                 UploadLogsToS3Bucket: '{{ UploadLogsToS3Bucket }}'
@@ -435,7 +435,7 @@ Resources:
               Script: |-
                 def script_handler(events, context):
                   return {'message': 'No Unmanaged Instances found in the Diagnosis and Remediate Results.'}
-              Runtime: python3.11
+              Runtime: python3.12
               Handler: script_handler
             outputs:
               - Type: String
@@ -602,7 +602,7 @@ Resources:
                         return {"status": "error", "message": f"S3 error: {str(e)}"}
                     except Exception as e:
                         return {"status": "error", "message": f"Error processing file: {str(e)}"}
-              Runtime: python3.11
+              Runtime: python3.12
               InputPayload:
                 DiagnoseS3Path: '{{ DiagnoseAndRemediateS3Results }}'
               Handler: script_handler
@@ -697,7 +697,7 @@ Resources:
                                 'failed_deletes': failed_deletes, 'not_found_instances': not_found_str}
                     return {'message': 'Successfully Added Tags', 'successful_deletes': '', 'failed_deletes': '',
                             'not_found_instances': not_found_str}
-              Runtime: python3.11
+              Runtime: python3.12
               InputPayload:
                 UnmanagedInstances: '{{ GetInstancesFromS3.UnmanagedInstances }}'
               Handler: script_handler
@@ -965,7 +965,7 @@ Resources:
                     except Exception as e:
                         print(f"Lambda execution failed: {str(e)}")
                         raise
-              Runtime: python3.11
+              Runtime: python3.12
               InputPayload:
                 OutputS3Bucket: '{{ UploadLogsToS3Bucket }}'
                 OrchestratorAutomationID: '{{ OrchestratorAutomationID }}'
@@ -977,7 +977,7 @@ Resources:
               Script: |-
                 def script_handler(events, context):
                   return {'message': 'No Unmanaged Instances found.'}
-              Runtime: python3.11
+              Runtime: python3.12
               Handler: script_handler
             outputs:
               - Type: String
@@ -1497,7 +1497,7 @@ Resources:
                             except ClientError as e:
                                 return {'OriginalUserData': '', 'state': '', 'SSMManaged': '', 'instance_profile': '',
                                         'platform': '', 'error': f"Error: {str(e)}"}
-                      Runtime: python3.11
+                      Runtime: python3.12
                       InputPayload:
                         InstanceId: '{{ InstanceId }}'
                       Handler: script_handler
@@ -1531,7 +1531,7 @@ Resources:
                           prerequisite_step_error = events['Error']
                           message = f"[SKIPPED]: Instance does not meet the prerequisites: {prerequisite_step_error}"
                           return {'message': message}
-                      Runtime: python3.11
+                      Runtime: python3.12
                       InputPayload:
                         OriginalState: '{{ getInstanceProperties.state }}'
                         Error: '{{ getInstanceProperties.error }}'
@@ -1834,7 +1834,7 @@ Resources:
                                 print(f"Caught error: {str(e)}")
 
                             return {'InstallAgentScript': modified_script}
-                      Runtime: python3.11
+                      Runtime: python3.12
                       InputPayload:
                         instance: '{{ InstanceId }}'
                         s3bucket: '{{ UploadLogsToS3Bucket }}'
@@ -1949,7 +1949,7 @@ Resources:
                                 return {
                                     'output': f'Error: {str(e)}'
                                 }
-                      Runtime: python3.11
+                      Runtime: python3.12
                       InputPayload:
                         Instance: '{{ InstanceId }}'
                       Handler: lambda_handler
@@ -1991,7 +1991,7 @@ Resources:
                           original_state = events['OriginalState']
                           message = f"[ERROR]: Unable to start the instance. Original State was {original_state}."
                           return {'message': message}
-                      Runtime: python3.11
+                      Runtime: python3.12
                       InputPayload:
                         OriginalState: '{{ getInstanceProperties.state }}'
                       Handler: script_handler
@@ -2009,7 +2009,7 @@ Resources:
                           original_state = events['OriginalState']
                           message = f"[ERROR]: Unable to restore the instance. Original State was {original_state}."
                           return {'message': message}
-                      Runtime: python3.11
+                      Runtime: python3.12
                       InputPayload:
                         OriginalState: '{{ getInstanceProperties.state }}'
                       Handler: script_handler
@@ -2027,7 +2027,7 @@ Resources:
                           original_state = events['OriginalState']
                           message = f"[ERROR]: Unable to stop the instance. Original State was {original_state}."
                           return {'message': message}
-                      Runtime: python3.11
+                      Runtime: python3.12
                       InputPayload:
                         OriginalState: '{{ getInstanceProperties.state }}'
                       Handler: script_handler
@@ -2104,7 +2104,7 @@ Resources:
                                     else:
                                         text += f"Error occurred while accessing S3 bucket: {error_code} - {error_message}"
                             return {'output': text}
-                      Runtime: python3.11
+                      Runtime: python3.12
                       InputPayload:
                         prerequisiteError: '{{ HandlePrerequisiteEvaluationError.message}}'
                         restoreinstanceStateError: '{{ HandleRestoreInstanceStateError.message}}'
@@ -2127,7 +2127,7 @@ Resources:
                     action: aws:executeScript
                     isEnd: true
                     inputs:
-                      Runtime: python3.11
+                      Runtime: python3.12
                       Handler: script_handler
                       Script: |-
                         def script_handler(events, context):
